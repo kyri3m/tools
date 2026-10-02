@@ -16,7 +16,7 @@ cat > "$TMP/bin/nginx" <<'STUB'
 printf 'nginx %s\n' "$*" >> "$NGX_TEST/calls"
 if [[ ${1:-} == -v ]]; then echo 'nginx version: nginx/1.26.3'; exit; fi
 if [[ -f $NGX_TEST/fail-test && ${1:-} == -t ]]; then rm "$NGX_TEST/fail-test"; echo '模拟配置错误' >&2; exit 1; fi
-if [[ ${1:-} == -T ]]; then cat "$NGX_ROOT"/etc/nginx/sites-enabled/*.conf; fi
+if [[ ${1:-} == -T ]]; then cat "$NGX_ROOT"/etc/nginx/sites-enabled/*.conf "$NGX_ROOT"/etc/nginx/conf.d/*.conf; fi
 exit 0
 STUB
 cat > "$TMP/bin/systemctl" <<'STUB'
@@ -44,11 +44,17 @@ exit 0
 STUB
 cat > "$TMP/bin/curl" <<'STUB'
 #!/usr/bin/env bash
-if [[ $1 == -4 ]]; then echo 203.0.113.5; else echo 2001:db8::5; fi
+case ${*: -1} in
+    https://www.cloudflare.com/ips-v4) [[ ! -f $NGX_TEST/fail-download ]] || exit 22; cat "$NGX_TEST/cf4";;
+    https://www.cloudflare.com/ips-v6) cat "$NGX_TEST/cf6";;
+    *) if [[ $1 == -4 ]]; then echo 203.0.113.5; else echo 2001:db8::5; fi;;
+esac
 STUB
 cat > "$TMP/bin/getent" <<'STUB'
 #!/usr/bin/env bash
 if [[ -f $NGX_TEST/bad-dns ]]; then echo '203.0.113.6 STREAM example.test';
+elif [[ -f $NGX_TEST/dns ]] && awk -v d="$2" '$1==d {f=1} END {exit !f}' "$NGX_TEST/dns"; then
+    awk -v d="$2" '$1==d {print $2, "STREAM", d}' "$NGX_TEST/dns"
 else echo '203.0.113.5 STREAM example.test'; fi
 STUB
 cat > "$TMP/bin/certbot" <<'STUB'
@@ -81,6 +87,8 @@ run() { "$BASE/ngx" "$@" > "$TMP/output" 2>&1 || { cat "$TMP/output"; return 1; 
 reject() { if "$BASE/ngx" "$@" > "$TMP/output" 2>&1; then echo "应拒绝：$*"; exit 1; fi; }
 contains() { grep -Fq -- "$2" "$1" || { echo "未找到：$2 ($1)"; cat "$1"; exit 1; }; }
 report() { printf 'PASS %s\n' "$*"; }
+cp "$BASE/ngx" "$TMP/standalone-ngx"
+"$TMP/standalone-ngx" install > "$TMP/standalone.log" 2>&1
 run help
 contains "$TMP/output" 'ngx —— nginx 管理'
 run install
@@ -93,10 +101,21 @@ contains "$CONF" 'listen 10618 ssl;'
 contains "$CONF" 'http2 on;'
 contains "$CONF" 'https://$host:10618$request_uri'
 contains "$NGX_ROOT/etc/nginx/snippets/ngx-proxy.conf" 'proxy_set_header Range $http_range;'
-contains "$TMP/output" 'MEDIA_HTTP_TRUSTED_PROXIES=127.0.0.1,::1'
+contains "$TMP/output" 'MEDIA_HTTP_TRUSTED_PROXIES= 应用直接跑在本机填 127.0.0.1,::1'
+contains "$TMP/output" 'compose 网络的网关'
+contains "$TMP/output" '中心公网地址：https://emby.example.test:10618'
+# EmbyHub sets its own security headers; nginx must not add conflicting copies.
+if grep -Fq 'ngx-security.conf' "$CONF"; then echo 'emby 站点不应包含 ngx-security.conf'; exit 1; fi
+contains "$CONF" 'EmbyHub 自带安全响应头'
 contains "$TMP/calls" '--deploy-hook systemctl reload nginx'
 contains "$NGX_ROOT/etc/ngx/config" 'EMAIL=admin@example.test'
 run add proxy --type proxy --domain proxy.example.test --port 10800 --upstream localhost:9000 --no-tls
+contains "$NGX_ROOT/etc/nginx/sites-available/ngx-proxy.conf" 'ngx-security.conf'
+run add std443 --type emby --domain std443.example.test --port 443
+contains "$NGX_ROOT/etc/nginx/sites-available/ngx-std443.conf" 'return 301 https://$host$request_uri;'
+contains "$TMP/output" '中心公网地址：https://std443.example.test'
+if grep -Fq 'host:443' "$NGX_ROOT/etc/nginx/sites-available/ngx-std443.conf"; then echo '443 跳转不应带 :443'; exit 1; fi
+run rm std443 --yes
 run add 静态站点 --type static --domain static.example.test --port 10801 --root /var/www/site --no-tls
 contains "$NGX_ROOT/etc/nginx/sites-available/ngx-静态站点.conf" 'try_files $uri $uri/ =404;'
 run status
@@ -217,6 +236,8 @@ contains "$TMP/output" '/hello'
 reject doctor
 contains "$TMP/output" '上游不可达'
 report 'logs / top / doctor'
+# shellcheck source=test/followup.sh
+source "$BASE/test/followup.sh"
 # 用真实 nginx 解析所有模板、TLS、IPv6、静态站点、proxy；绝不 reload 系统服务。
 cat > "$TMP/nginx.conf" <<CONF
 user root;
@@ -234,9 +255,13 @@ http {
     include $NGX_ROOT/etc/nginx/sites-enabled/ngx-*.conf;
 }
 CONF
+if python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(); s.close()' 2>/dev/null; then
 "$REAL_NGINX" -t -p "$TMP/" -c "$TMP/nginx.conf" > "$TMP/real-nginx.log" 2>&1 || { cat "$TMP/real-nginx.log"; exit 1; }
 cat "$TMP/real-nginx.log"
 report '真实 nginx -t -p 临时目录 -c 临时主配置（TLS 自签证书）'
+else
+    echo 'SKIP 真实 nginx 校验（无 socket 权限）'
+fi
 run rm emby --yes
 [[ -f $NGX_ROOT/etc/letsencrypt/live/ngx-emby/privkey.pem ]]
 run cert rm emby --yes

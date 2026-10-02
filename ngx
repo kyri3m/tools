@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # 单引号内的 nginx 变量在 nginx 中展开。
 # ngx —— nginx 管理；元数据仅解析，不执行。事务只恢复受管文件。
 export LC_ALL=C.UTF-8
 set -o pipefail
@@ -22,7 +23,7 @@ pad() {
 ask() { local answer; read -r -p "  $2" answer || return 1; printf -v "$1" '%s' "${answer:-${3:-}}"; }
 confirm() { local answer; read -r -p "  $1 [y/N] " answer || return 1; [[ $answer == y || $answer == Y ]]; }
 [[ $EUID -eq 0 ]] || die '需要 root 权限运行'
-BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 ROOT=${NGX_ROOT:-}
 [[ $ROOT != / ]] || ROOT=''
 [[ -z $ROOT || $ROOT =~ ^/[a-zA-Z0-9_./-]+$ && $ROOT != *'/../'* && $ROOT != */.. ]] || die 'NGX_ROOT 必须是安全的绝对路径'
@@ -64,7 +65,7 @@ domains_valid() {
     IFS=, read -r -a domains <<< "$1"
     for domain in "${domains[@]}"; do host_valid "$domain" || return 1; done
 }
-path_valid() { [[ $1 =~ ^/[a-zA-Z0-9_./-]+$ && $1 != *'/../'* && $1 != */.. && $1 != *'//'* ]]; }
+path_valid() { [[ $1 =~ ^/[[:alnum:]_./-]+$ && $1 != *'/../'* && $1 != */.. && $1 != *'//'* ]]; }
 upstream_valid() {
     local host port
     if [[ $1 == unix:* ]]; then path_valid "${1#unix:}"; return; fi
@@ -80,6 +81,7 @@ PY
 }
 email_valid() { [[ $1 =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; }
 cert_id() {
+    if [[ -n ${CERT_NAME:-} ]]; then printf '%s' "$CERT_NAME"; return; fi
     if [[ $NAME =~ ^[a-zA-Z0-9_-]+$ ]]; then printf 'ngx-%s' "$NAME";
     else printf 'ngx-%s' "$(printf %s "$NAME" | sha256sum | cut -c1-24)"; fi
 }
@@ -89,31 +91,46 @@ load_site() {
     local file=$STATE/sites/$NAME.env key value
     [[ -f $file && ! -L $file ]] || { err "站点不存在：$NAME"; return 1; }
     TYPE='' DOMAINS='' PORT='' UPSTREAM='' DOCROOT='' TLS='' CREATED=''
+    CLOUDFLARE=off CF_ONLY=off CERT_NAME='' FILE='' LINKS='' LISTENS='' UPSTREAMS='' CERT_PATHS='' ACCESS_LOGS='' ERROR_LOGS='' ENABLED='' ORIGIN_FILE=''
     while IFS='=' read -r key value; do
         case $key in
-            TYPE|DOMAINS|PORT|UPSTREAM|DOCROOT|TLS|CREATED) printf -v "$key" '%s' "$value" ;;
+            TYPE|DOMAINS|PORT|UPSTREAM|DOCROOT|TLS|CREATED|CLOUDFLARE|CF_ONLY|CERT_NAME|FILE|LINKS|LISTENS|UPSTREAMS|CERT_PATHS|ACCESS_LOGS|ERROR_LOGS|ENABLED|ORIGIN_FILE) printf -v "$key" '%s' "$value" ;;
             *) err "元数据字段无效：$key"; return 1 ;;
         esac
     done < "$file"
-    validate_site
+    if [[ $TYPE == adopted ]]; then
+        adopted_refresh
+    else validate_site; fi
 }
 validate_site() {
     # shellcheck disable=SC2015 # 整条校验链失败均报告同一错误。
     name_valid "$NAME" && [[ $TYPE == emby || $TYPE == proxy || $TYPE == static ]] &&
     domains_valid "$DOMAINS" && port_valid "$PORT" && [[ $PORT != 80 ]] &&
     upstream_valid "$UPSTREAM" && path_valid "$DOCROOT" && [[ $TLS == on || $TLS == off ]] &&
+    [[ $CLOUDFLARE == on || $CLOUDFLARE == off ]] && [[ $CF_ONLY == on || $CF_ONLY == off ]] &&
+    [[ $CF_ONLY == off || $CLOUDFLARE == on ]] &&
+    [[ -z $CERT_NAME || $CERT_NAME =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] &&
     [[ $CREATED =~ ^[0-9T:Z-]+$ ]] || { err '输入无效：检查名称、类型、域名、端口（80 保留）、上游或目录'; return 1; }
 }
 save_site() {
     printf 'TYPE=%s\nDOMAINS=%s\nPORT=%s\nUPSTREAM=%s\nDOCROOT=%s\nTLS=%s\nCREATED=%s\n' \
-        "$TYPE" "$DOMAINS" "$PORT" "$UPSTREAM" "$DOCROOT" "$TLS" "$CREATED" > "$STATE/sites/$NAME.env"
+        "$TYPE" "$DOMAINS" "$PORT" "$UPSTREAM" "$DOCROOT" "$TLS" "$CREATED" > "$STATE/sites/$NAME.env" || return 1
+    printf 'CLOUDFLARE=%s\nCF_ONLY=%s\nCERT_NAME=%s\nORIGIN_FILE=%s\n' "$CLOUDFLARE" "$CF_ONLY" "$CERT_NAME" "${ORIGIN_FILE:-}" >> "$STATE/sites/$NAME.env"
 }
 check_conflicts() {
     local file other p ds domain data
     for file in "$STATE"/sites/*.env; do
         other=${file##*/}; other=${other%.env}; [[ $other == "$NAME" ]] && continue
         p=$(sed -n 's/^PORT=//p' "$file")
-        [[ $p != "$PORT" ]] || { err "端口 $PORT 已属于 $other"; return 1; }
+        if grep -qx 'TYPE=adopted' "$file"; then
+            p=$( (load_site "$other" && printf '%s' "$LISTENS") ) || return 1
+            p=$(python3 - "$p" <<'PORTS'
+import re,sys
+print(','.join(re.findall(r'(?:^|,)(?:[^, ]*:)?([0-9]+)',sys.argv[1])))
+PORTS
+)
+        fi
+        [[ ,$p, != *,"$PORT",* ]] || { err "端口 $PORT 已属于 $other"; return 1; }
         ds=$(sed -n 's/^DOMAINS=//p' "$file")
         for domain in ${DOMAINS//,/ }; do
             [[ ,${ds,,}, != *,${domain,,},* ]] || { err "域名 $domain 已属于 $other"; return 1; }
@@ -127,11 +144,11 @@ check_conflicts() {
 # 事务快照包含证书私钥，仅保存在 0700 临时目录，结束后删除。
 managed_files() {
     local f
-    for f in "$ETC"/sites-available/ngx-* "$ETC"/sites-enabled/ngx-* "$ETC"/snippets/ngx-* "$ETC"/conf.d/ngx-* \
-        "$ETC/sites-enabled/default" "$ETC/ngx-default.disabled" "$STATE" "$LE"; do
+    for f in "$ETC" "$STATE" "$LE" "$ROOT/etc/systemd/system/ngx-cf-update.service" "$ROOT/etc/systemd/system/ngx-cf-update.timer" "$ROOT/etc/systemd/system/timers.target.wants/ngx-cf-update.timer"; do
         [[ -e $f || -L $f ]] && printf '%s\n' "${f#"${ROOT:-/}"}" | sed 's#^/##'
     done
 }
+
 begin() {
     [[ -z $TX ]] || return 0
     mkdir -p "$ROOT/run/lock" || return 1
@@ -139,8 +156,11 @@ begin() {
     flock -n 9 || { err '另一个 ngx 修改正在进行'; return 1; }
     TX=$(mktemp -d "$ROOT/run/ngx.XXXXXXXX") || return 1
     chmod 700 "$TX"
+    service_cmd systemctl is-active ngx-cf-update.timer > "$TX/timer-active" 2>/dev/null || :
     managed_files > "$TX/files"
-    tar -czf "$TX/before.tar.gz" -C "${ROOT:-/}" -T "$TX/files" || return 1
+    if ! tar -czf "$TX/before.tar.gz" -C "${ROOT:-/}" -T "$TX/files"; then
+        rm -rf -- "$TX"; TX=''; return 1
+    fi
     trap 'rollback' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -148,12 +168,16 @@ begin() {
 rollback() {
     [[ -n $TX ]] || return 0
     local f snapshot=$TX
-    for f in "$ETC"/sites-available/ngx-* "$ETC"/sites-enabled/ngx-* "$ETC"/snippets/ngx-* "$ETC"/conf.d/ngx-* \
-        "$ETC/sites-enabled/default" "$ETC/ngx-default.disabled" "$STATE" "$LE"; do rm -rf -- "$f"; done
+    if [[ -f $TX/timer-changed ]]; then service_cmd systemctl stop ngx-cf-update.timer || warn '无法停止 CF 定时器'; fi
+    for f in "$ETC" "$STATE" "$LE" "$ROOT/etc/systemd/system/ngx-cf-update.service" "$ROOT/etc/systemd/system/ngx-cf-update.timer" "$ROOT/etc/systemd/system/timers.target.wants/ngx-cf-update.timer"; do rm -rf -- "$f"; done
     if ! tar -xzf "$snapshot/before.tar.gz" -C "${ROOT:-/}"; then
         err "回滚解包失败，保留快照：$snapshot"; TX=''; return 1
     fi
     TX=''
+    service_cmd systemctl daemon-reload || warn 'systemd daemon-reload 失败'
+    if [[ -f $snapshot/timer-changed ]] && grep -qx active "$snapshot/timer-active"; then
+        service_cmd systemctl start ngx-cf-update.timer || warn '无法恢复 CF 定时器运行状态'
+    fi
     if ngtest && service_cmd systemctl reload nginx; then warn '已恢复修改前配置并重新加载';
     else err "文件已恢复，但 nginx 恢复加载失败；快照：$snapshot"; return 1; fi
     rm -rf -- "$snapshot"
@@ -161,19 +185,69 @@ rollback() {
 finish() {
     apply || return 1
     rm -rf -- "$TX"; TX=''
+    flock -u 9
     trap - EXIT INT TERM
     ok '配置已校验并加载'
 }
 layout() {
     mkdir -p "$ETC"/{sites-available,sites-enabled,snippets,conf.d} "$STATE/sites" "$WEB/.well-known/acme-challenge" "$LOG" || return 1
-    local f
-    for f in ngx-ssl.conf ngx-security.conf ngx-proxy.conf; do
-        [[ -f $BASE/templates/$f ]] || { err "缺少模板 $BASE/templates/$f"; return 1; }
-        cp -- "$BASE/templates/$f" "$ETC/snippets/$f" || return 1
-    done
-    cp -- "$BASE/templates/ngx-http.conf" "$ETC/conf.d/ngx-http.conf" || return 1
+    cat > "$ETC/snippets/ngx-ssl.conf" <<'TEMPLATE' || return 1
+# managed-by: ngx
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+ssl_prefer_server_ciphers off;
+ssl_session_cache shared:ngx_ssl:10m;
+ssl_session_timeout 1d;
+ssl_session_tickets off;
+# Let's Encrypt 已停止 OCSP 服务。
+ssl_stapling off;
+add_header Strict-Transport-Security "max-age=15768000" always;
+TEMPLATE
+    cat > "$ETC/snippets/ngx-security.conf" <<'TEMPLATE' || return 1
+# managed-by: ngx
+add_header X-Content-Type-Options nosniff always;
+add_header Referrer-Policy strict-origin-when-cross-origin always;
+add_header X-Frame-Options SAMEORIGIN always;
+# 不设置 CSP：SPA 可能需要 challenges.cloudflare.com 的 Turnstile。
+TEMPLATE
+    cat > "$ETC/snippets/ngx-proxy.conf" <<'TEMPLATE' || return 1
+# managed-by: ngx
+proxy_http_version 1.1;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection $connection_upgrade;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-Host $host;
+proxy_set_header X-Forwarded-Port $server_port;
+proxy_set_header Range $http_range;
+proxy_set_header If-Range $http_if_range;
+proxy_buffering off;
+proxy_request_buffering off;
+proxy_cache off;
+proxy_read_timeout 3600s;
+proxy_send_timeout 3600s;
+send_timeout 3600s;
+proxy_redirect off;
+client_max_body_size 100m;
+gzip on;
+gzip_proxied any;
+# gzip 默认包含 text/html；不包含 video/* 或 application/octet-stream。
+gzip_types text/plain text/css application/javascript application/json application/xml image/svg+xml;
+TEMPLATE
+    cat > "$ETC/conf.d/ngx-http.conf" <<'TEMPLATE' || return 1
+# managed-by: ngx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+log_format ngx '$remote_addr - $remote_user [$time_local] "$request" '
+               '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
+               '$request_time $upstream_response_time $upstream_status "$http_range"';
+TEMPLATE
     cat > "$ETC/snippets/ngx-acme.conf" <<EOT
+# managed-by: ngx
 location ^~ /.well-known/acme-challenge/ {
+    allow all;
     root $WEB;
     default_type text/plain;
     try_files \$uri =404;
@@ -185,6 +259,7 @@ EOT
         warn 'Debian default 已备份为 /etc/nginx/ngx-default.disabled'
     fi
     cat > "$ETC/sites-available/ngx-acme-80.conf" <<EOT
+# managed-by: ngx
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -198,11 +273,16 @@ EOT
     ln -sfn "$ETC/sites-available/ngx-acme-80.conf" "$ETC/sites-enabled/ngx-acme-80.conf"
 }
 generate() {
-    local live=${1:-$TLS} cert target scheme
+    local live=${1:-$TLS} cert target scheme xff='$proxy_add_x_forwarded_for'
+    [[ ${CLOUDFLARE:-off} != on ]] || xff='$remote_addr'
+    if [[ ${CLOUDFLARE:-off} == on && ! -s $STATE/cloudflare-ips.txt ]]; then
+        err '请先运行 ngx cf update 获取 Cloudflare 地址范围'; return 1
+    fi
     cert=$(cert_id); scheme=http; [[ $live == on ]] && scheme=https
     target=$UPSTREAM
     [[ $target != unix:* ]] || target="unix:$ROOT${target#unix:}:"
     cat > "$ETC/sites-available/ngx-$NAME.conf" <<EOT
+# managed-by: ngx
 # 由 ngx 管理；ngx set 会从元数据重新生成，覆盖手工编辑。
 server {
     listen $PORT$([[ $live == on ]] && printf ' ssl');
@@ -210,8 +290,12 @@ server {
     server_name ${DOMAINS//,/ };
     access_log $LOG/ngx-$NAME.access.log ngx;
     error_log $LOG/ngx-$NAME.error.log;
-    include $ETC/snippets/ngx-security.conf;
+$([[ $TYPE == emby ]] && printf '    # EmbyHub 自带安全响应头，这里不再重复添加，避免出现互相冲突的值。\n' || printf '    include %s/snippets/ngx-security.conf;\n' "$ETC")
+    include $ETC/snippets/ngx-acme.conf;
 EOT
+    if [[ ${CF_ONLY:-off} == on ]]; then
+        printf '    include %s/snippets/ngx-cloudflare-allow.conf;\n' "$ETC" >> "$ETC/sites-available/ngx-$NAME.conf" || return 1
+    fi
     if [[ $live == on ]]; then
         cat >> "$ETC/sites-available/ngx-$NAME.conf" <<EOT
     http2 on;
@@ -223,7 +307,10 @@ EOT
     if [[ $TYPE == static ]]; then
         cat >> "$ETC/sites-available/ngx-$NAME.conf" <<EOT
     root $ROOT$DOCROOT;
-    location / { try_files \$uri \$uri/ =404; }
+    location / {
+$(cf_gate)
+        try_files \$uri \$uri/ =404;
+    }
 EOT
     else
         if [[ $TYPE == emby ]]; then
@@ -235,7 +322,9 @@ EOT
         fi
         cat >> "$ETC/sites-available/ngx-$NAME.conf" <<EOT
     location / {
+$(cf_gate)
         include $ETC/snippets/ngx-proxy.conf;
+        proxy_set_header X-Forwarded-For $xff;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_pass http://$target;
     }
@@ -248,7 +337,11 @@ server {
     listen [::]:80;
     server_name ${DOMAINS//,/ };
     include $ETC/snippets/ngx-acme.conf;
-    location / { return 301 $scheme://\$host:$PORT\$request_uri; }
+$(cf_acl)
+    location / {
+$(cf_gate)
+        return 301 $scheme://\$host$([[ $PORT == 443 ]] || printf ':%s' "$PORT")\$request_uri;
+    }
 }
 EOT
 }
@@ -276,6 +369,10 @@ cert_preflight() {
     ipv6=$(curl -6 -fsS --max-time 8 https://api6.ipify.org) || ipv6=''
     [[ -n $ipv4 || -n $ipv6 ]] || { err '无法获取本机公网 IP，无法验证 DNS'; return 1; }
     for domain in ${DOMAINS//,/ }; do
+        if [[ $(cf_detect "$domain") == 橙云 ]]; then
+            warn "$domain 为橙云：请确认 Cloudflare SSL 模式为 Full (strict)，HTTP-01 路径无 WAF/缓存拦截；首次签发建议先灰云"
+            continue
+        fi
         ips=$(getent ahosts "$domain" | awk '{print $1}' | sort -u)
         [[ -n $ips ]] || { err "$domain 无 A/AAAA 解析"; return 1; }
         found=0
@@ -287,7 +384,7 @@ cert_preflight() {
     done
     offer_firewall 80 || return 1
     [[ $(firewall_state 80) == 已开放 ]] || { err '无法确认 fw 已放行 TCP/80；请运行 fw status / fw open 80 tcp ACME'; return 1; }
-    hint 'HTTP-01 还需云安全组/NAT 放行公网 TCP/80；本机检查不能证明外网可达，最终以 ACME 验证为准。Cloudflare 请使用灰云。'
+    hint 'HTTP-01 还需云安全组/NAT 放行公网 TCP/80；本机检查不能证明外网可达，最终以 ACME 验证为准。橙云首次签发失败时请临时切换 Cloudflare 灰云。'
 }
 issue() {
     cert_preflight || return 1
@@ -305,12 +402,15 @@ emby_hint() {
     [[ $TYPE == emby ]] || return 0
     local scheme=http; [[ $TLS == on ]] && scheme=https
     title 'EmbyHub 应用设置（仅提示，不修改应用）'
-    hint '.env：MEDIA_HTTP_TRUSTED_PROXIES=127.0.0.1,::1'
-    hint "系统 → 设置 → 中心公网地址：$scheme://${DOMAINS%%,*}:$PORT"
+    hint '.env：MEDIA_HTTP_TRUSTED_PROXIES= 应用直接跑在本机填 127.0.0.1,::1；跑在 Docker 里填 compose 网络的网关'
+    hint '      （docker network inspect <项目>_default 的 Gateway，建议用 override 固定网段）'
+    local port_part=":$PORT"; [[ ($scheme == https && $PORT == 443) || ($scheme == http && $PORT == 80) ]] && port_part=""
+    hint "系统 → 设置 → 中心公网地址：$scheme://${DOMAINS%%,*}$port_part"
     hint "内置节点也使用此公网 URL；执行 cli node register-center --rotate，或在管理后台更新。"
 }
 add_site() {
     NAME=${1:-}; (($#)) && shift
+    CLOUDFLARE=off CF_ONLY=off CERT_NAME=''
     TYPE=emby DOMAINS='' PORT=10618 UPSTREAM=127.0.0.1:18618 DOCROOT=/var/www/html TLS=on CREATED=$(date -u +%FT%TZ)
     while (($#)); do
         case $1 in
@@ -318,6 +418,8 @@ add_site() {
                 (($#>=2)) || { err "缺少 $1 的值"; return 1; }
                 case $1 in --type) TYPE=$2;; --domain) DOMAINS=${2,,};; --port) PORT=$2;; --upstream) UPSTREAM=$2;; --root) DOCROOT=$2;; --email) EMAIL=$2;; esac
                 shift 2 ;;
+            --cloudflare) CLOUDFLARE=on; shift ;;
+            --cf-only) CLOUDFLARE=on CF_ONLY=on; shift ;;
             --no-tls) TLS=off; shift ;;
             *) err "未知参数：$1"; return 1 ;;
         esac
@@ -331,18 +433,21 @@ add_site() {
     finish || return 1
     offer_firewall "$PORT" || return 1
     emby_hint
+    cf_warnings
 }
 change_site() {
     local command=$1; shift
     load_site "${1:-}" || return 1; shift
+    if [[ $TYPE == adopted ]]; then adopted_change "$command" "$@"; return; fi
+    if [[ $command == set && $# == 3 && ${3:-} == --cf-only ]]; then CF_ONLY=on; set -- "$1" "$2"; fi
     local was_enabled=0
     [[ -L $ETC/sites-enabled/ngx-$NAME.conf ]] && was_enabled=1
     case $command in
         rm)
             ((YES)) || confirm "删除站点 $NAME？证书默认保留" || return 1 ;;
         set)
-            [[ $# == 2 ]] || { err '用法：ngx set <名称> upstream|port|domain <值>'; return 1; }
-            case $1 in upstream) UPSTREAM=$2;; port) PORT=$2;; domain) DOMAINS=${2,,};; *) err '字段无效'; return 1;; esac
+            [[ $# == 2 ]] || { err '用法：ngx set <名称> upstream|port|domain|cloudflare <值>'; return 1; }
+            case $1 in cloudflare) CLOUDFLARE=$2; [[ $2 != off ]] || CF_ONLY=off;; upstream) UPSTREAM=$2;; port) PORT=$2;; domain) DOMAINS=${2,,};; *) err '字段无效'; return 1;; esac
             validate_site || return 1 ;;
         *) [[ $# == 0 ]] || { err '多余参数'; return 1; } ;;
     esac
@@ -364,18 +469,22 @@ change_site() {
             fi
             save_site && generate || return 1 ;;
     esac
-    finish
+    finish || return 1
+    if [[ $command == set && $1 == port ]]; then offer_firewall "$PORT" || return 1; fi
+    cf_warnings
 }
 cert_days() {
     local expiry epoch
-    expiry=$(openssl x509 -in "$LE/live/$(cert_id)/fullchain.pem" -noout -enddate 2>/dev/null) || { echo '?'; return; }
+    expiry=$(openssl x509 -in "$(cert_path)" -noout -enddate 2>/dev/null) || { echo '?'; return; }
     epoch=$(date -d "${expiry#notAfter=}" +%s) || { echo '?'; return; }
     echo "$(( (epoch - $(date +%s)) / 86400 ))"
 }
 reachable() {
-    [[ $TYPE != static ]] || { echo '-'; return; }
+    [[ -n $UPSTREAM && $TYPE != static ]] || { echo '-'; return; }
     if [[ $UPSTREAM == unix:* ]]; then
-        if python3 - "$ROOT${UPSTREAM#unix:}" <<'PY'
+        local socket_path=${UPSTREAM#unix:}
+        [[ -z $ROOT || $socket_path == "$ROOT/"* ]] || socket_path=$ROOT$socket_path
+        if python3 - "$socket_path" <<'PY'
 import socket,sys
 s=socket.socket(socket.AF_UNIX); s.settimeout(1)
 try: s.connect(sys.argv[1])
@@ -403,10 +512,12 @@ status() {
     local file enabled days colour
     for file in "$STATE"/sites/*.env; do
         load_site "$(basename "$file" .env)" || continue
-        enabled=否; [[ -L $ETC/sites-enabled/ngx-$NAME.conf ]] && enabled=是
+        enabled=否; site_enabled && enabled=是
         days='-'; colour=$D
         if [[ $TLS == on ]]; then days=$(cert_days); colour=$G; [[ $days == '?' ]] && colour=$R; [[ $days != '?' ]] && ((days<14)) && colour=$Y; fi
-        printf '  %s%s%s%s%s%s  %s%s%s  %s  %s\n' "$(pad "$NAME" 18)" "$(pad "$TYPE" 9)" "$(pad "$DOMAINS" 28)" "$(pad "$PORT" 8)" "$(pad "$UPSTREAM" 27)" "$(reachable)" "$colour" "$days" "$N" "$enabled" "$(firewall_state "$PORT")"
+        printf '  %s%s%s%s%s%s  %s%s%s  %s  %s\n' "$(pad "$NAME" 18)" "$(pad "${TYPE/adopted/接管}" 9)" "$(pad "$DOMAINS" 28)" "$(pad "$PORT" 8)" "$(pad "$UPSTREAM" 27)" "$(reachable)" "$colour" "$days" "$N" "$enabled" "$(firewall_state "$PORT")"
+        cf_display
+        if [[ $TYPE == adopted ]]; then hint "接管：$FILE；监听 $LISTENS；上游 $UPSTREAMS；证书 $CERT_PATHS"; fi
     done
     title '外部站点（只读）'
     for file in "$ETC"/sites-available/* "$ETC"/sites-enabled/*; do
@@ -422,7 +533,8 @@ cert_command() {
             load_site "${1:-}" || return 1; shift
             if [[ ${1:-} == --email && $# == 2 ]]; then EMAIL=$2; shift 2; fi
             [[ $# == 0 ]] || { err '证书签发参数无效'; return 1; }
-            [[ -L $ETC/sites-enabled/ngx-$NAME.conf ]] || { err '请先启用站点'; return 1; }
+            site_enabled || { err '请先启用站点'; return 1; }
+            if [[ $TYPE == adopted ]]; then adopted_issue; return; fi
             begin && issue || return 1
             TLS=on
             save_site && generate && finish ;;
@@ -434,11 +546,12 @@ cert_command() {
             for file in "$STATE"/sites/*.env; do
                 load_site "$(basename "$file" .env)" || continue
                 days=$(cert_days)
-                expiry=$(openssl x509 -in "$LE/live/$(cert_id)/fullchain.pem" -noout -enddate 2>/dev/null) || expiry=无证书
+                expiry=$(openssl x509 -in "$(cert_path)" -noout -enddate 2>/dev/null) || expiry=无证书
                 printf '%s  %s  %s  剩余 %s 天\n' "$NAME" "$DOMAINS" "$expiry" "$days"
             done
             certbot_cmd certificates ;;
         rm)
+            CERT_NAME=''
             NAME=${1:-}; name_valid "$NAME" || return 1
             if [[ -f $STATE/sites/$NAME.env ]]; then
                 load_site "$NAME" || return 1
@@ -479,13 +592,26 @@ restore() {
     python3 - "$archive" "$stage" "$ROOT" <<'PY' || return 1
 import os,sys,tarfile,pathlib
 archive,stage,root=sys.argv[1:]
+adopted=set()
+def relpath(p):
+    if root and p.startswith(root+'/'): p=p[len(root):]
+    return p.lstrip('/')
 def managed(n):
     p=pathlib.PurePosixPath(n)
-    return (n=='etc/ngx' or n.startswith('etc/ngx/') or n=='etc/letsencrypt' or n.startswith('etc/letsencrypt/') or
+    return (n in adopted or n=='etc/ngx' or n.startswith('etc/ngx/') or n=='etc/letsencrypt' or n.startswith('etc/letsencrypt/') or
             len(p.parts)==4 and p.parts[:2]==('etc','nginx') and p.parts[2] in ('sites-available','sites-enabled','snippets','conf.d') and p.name.startswith('ngx-'))
 try:
     with tarfile.open(archive,'r:gz') as t:
         members=t.getmembers(); names=set(); links=set()
+        for m in members:
+            if m.isfile() and m.name.startswith('etc/ngx/sites/') and m.name.endswith('.env'):
+                meta=dict(line.split('=',1) for line in t.extractfile(m).read().decode().splitlines() if '=' in line)
+                for value in [meta.get('FILE',''),meta.get('ORIGIN_FILE','')]+meta.get('LINKS','').split(','):
+                    if not value: continue
+                    n=relpath(value); p=pathlib.PurePosixPath(n)
+                    if len(p.parts)!=4 or p.parts[:2]!=('etc','nginx') or p.parts[2] not in ('sites-available','sites-enabled','conf.d') or '..' in p.parts:
+                        raise ValueError('接管归档路径越界')
+                    adopted.add(n); adopted.add(n+'.disabled')
         for m in members:
             p=pathlib.PurePosixPath(m.name)
             if p.is_absolute() or '..' in p.parts or m.name in names: raise ValueError('不安全或重复的归档路径')
@@ -497,8 +623,11 @@ try:
             if not managed(m.name): continue
             if m.issym():
                 # ngx 链接只允许 sites-enabled；证书链接仅允许相对 archive 目录。
-                if m.name.startswith('etc/nginx/sites-enabled/ngx-'):
-                    target=root+'/etc/nginx/sites-available/'+pathlib.PurePosixPath(m.name).name
+                if m.name.startswith('etc/nginx/sites-enabled/'):
+                    target=m.linkname
+                    resolved=relpath(target) if os.path.isabs(target) else os.path.normpath(os.path.join(os.path.dirname(m.name),target))
+                    if not resolved.startswith('etc/nginx/sites-available/') or '..' in pathlib.PurePosixPath(resolved).parts: raise ValueError('启用链接越界')
+                    target=root+'/'+resolved
                 elif m.name.startswith('etc/letsencrypt/live/') and not os.path.isabs(m.linkname):
                     target=m.linkname
                     resolved=os.path.normpath(os.path.join(os.path.dirname(m.name),target))
@@ -512,6 +641,21 @@ except (ValueError,OSError,tarfile.TarError) as e:
 PY
     local f
     for f in "$ETC"/sites-available/ngx-* "$ETC"/sites-enabled/ngx-* "$ETC"/snippets/ngx-* "$ETC"/conf.d/ngx-*; do rm -f -- "$f" || return 1; done
+    local metadata original
+    for metadata in "$STATE"/sites/*.env "$stage"/etc/ngx/sites/*.env; do
+        while IFS='=' read -r key original; do
+            case $key in FILE|ORIGIN_FILE|LINKS)
+                local paths item
+                IFS=, read -r -a paths <<< "$original"
+                for item in "${paths[@]}"; do
+                    case $item in "$ETC/sites-available/"*|"$ETC/sites-enabled/"*|"$ETC/conf.d/"*)
+                        path_valid "$item" || return 1
+                        rm -f -- "$item" "$item.disabled" || return 1;;
+                    esac
+                done;;
+            esac
+        done < "$metadata"
+    done
     rm -rf -- "$STATE" || return 1
     cp -a "$stage/etc/ngx" "$STATE" || return 1
     for f in sites-available sites-enabled snippets conf.d; do
@@ -535,7 +679,12 @@ logs() {
         esac
     done
     [[ -z $name ]] || load_site "$name" || return 1
-    if [[ -n $name ]]; then args+=("$LOG/ngx-$name.$kind.log");
+    if [[ -n $name && $TYPE == adopted ]]; then
+        local log_paths=$ACCESS_LOGS
+        [[ $kind != error ]] || log_paths=$ERROR_LOGS
+        if [[ -n $log_paths ]]; then IFS=, read -r -a args <<< "$log_paths";
+        else args+=("$LOG/$kind.log"); fi
+    elif [[ -n $name ]]; then args+=("$LOG/ngx-$name.$kind.log");
     else for file in "$LOG"/ngx-*."$kind".log; do args+=("$file"); done; fi
     ((${#args[@]})) || { hint '暂无日志'; return 0; }
     if ((follow)); then tail -n "$count" -F -- "${args[@]}"; else tail -n "$count" -- "${args[@]}"; fi
@@ -547,9 +696,11 @@ top_stats() {
             *) [[ -z $name ]] && name_valid "$1" || return 1; name=$1; shift;; esac
     done
     [[ -z $name ]] || load_site "$name" || return 1
-    python3 - "$LOG" "$name" "$since" <<'PY'
+    local adopted_logs=''
+    if [[ -n $name && $TYPE == adopted ]]; then adopted_logs=${ACCESS_LOGS:-$LOG/access.log}; fi
+    python3 - "$LOG" "$name" "$since" "$adopted_logs" <<'PY'
 import sys,glob,re,datetime,collections
-folder,name,since=sys.argv[1:]; files=glob.glob(folder+'/ngx-'+(name or '*')+'.access.log')
+folder,name,since,adopted=sys.argv[1:]; files=adopted.split(',') if adopted else glob.glob(folder+'/ngx-'+(name or '*')+'.access.log')
 cutoff=None
 if since: cutoff=datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(seconds=int(since[:-1])*{'m':60,'h':3600,'d':86400}[since[-1]])
 rows=[]
@@ -611,6 +762,21 @@ for (endpoint,name),count in seen.items():
     [[ -z $duplicates ]] || { warn "重复 server_name：$duplicates"; problems=1; }
     for file in "$STATE"/sites/*.env; do
         load_site "$(basename "$file" .env)" || { problems=1; continue; }
+        cf_display
+        cf_warnings
+        if [[ $TYPE == adopted ]]; then
+            local upstream original_upstream=$UPSTREAM certificate
+            for upstream in ${UPSTREAMS//,/ }; do
+                UPSTREAM=$upstream
+                if [[ $(reachable) == ✗ ]]; then warn "$NAME 接管上游不可达：$upstream"; problems=1; fi
+            done
+            UPSTREAM=$original_upstream
+            for certificate in ${CERT_PATHS//,/ }; do
+                if ! openssl x509 -checkend 1209600 -noout -in "$certificate" >/dev/null 2>&1; then
+                    warn "$NAME 接管证书不足 14 天或无法读取：$certificate"; problems=1
+                fi
+            done
+        fi
         if [[ $(reachable) == ✗ ]]; then warn "$NAME 上游不可达：$UPSTREAM"; problems=1; fi
         if [[ $TLS == on ]]; then
             days=$(cert_days)
@@ -620,6 +786,30 @@ for (endpoint,name),count in seen.items():
             fi
         fi
     done
+    for file in "$LE"/renewal/*.conf; do
+        if grep -Eq '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*nginx[[:space:]]*$' "$file"; then
+            warn "${file##*/} 使用 authenticator = nginx，插件会修改配置；建议 ngx cert issue <名称> 切换 webroot"
+            problems=1
+        fi
+    done
+    local listeners
+    listeners=$(ss -H -lntp) || listeners=''
+    for file in "$STATE"/sites/*.env; do
+        load_site "$(basename "$file" .env)" || continue
+        local ports=("$PORT") entries entry endpoint checked_port
+        if [[ $TYPE == adopted ]]; then
+            IFS=, read -r -a entries <<< "$LISTENS"
+            for entry in "${entries[@]}"; do
+                endpoint=${entry%% *}; checked_port=${endpoint##*:}
+                if port_valid "$checked_port"; then ports+=("$checked_port"); fi
+            done
+        fi
+        for checked_port in "${ports[@]}"; do
+            if awk -v p="$checked_port" '$4 ~ (":" p "$") && $0 !~ /"nginx"/ {found=1} END {exit !found}' <<< "$listeners"; then
+                warn "$NAME 端口 $checked_port 有非 nginx/未知进程监听冲突"; problems=1
+            fi
+        done
+    done
     ((problems==0)) && ok '未发现上述常见问题'
     return "$problems"
 }
@@ -628,7 +818,7 @@ install_ngx() {
         [[ -z $ROOT ]] || { err '测试根目录不允许 apt 安装，请提供命令桩'; return 1; }
         apt-get update && apt-get install -y nginx certbot || return 1
     fi
-    begin && layout && apply && service_cmd systemctl enable --now certbot.timer && finish
+    begin && layout && install_cf_timer && apply && service_cmd systemctl enable --now certbot.timer && finish
 }
 help_text() {
     cat <<'EOT'
@@ -639,9 +829,9 @@ ngx —— nginx 管理
   ngx install                    安装依赖、共享配置、ACME 入口和定时任务
   ngx add <名称> --type emby|proxy|static --domain d1[,d2]
       [--port 10618] [--upstream 127.0.0.1:18618] [--root /var/www/x]
-      [--no-tls] [--email you@x] [--open-firewall]
+      [--no-tls] [--email you@x] [--open-firewall] [--cloudflare] [--cf-only]
   ngx edit|show|enable|disable <名称>
-  ngx set <名称> upstream|port|domain <值>
+  ngx set <名称> upstream|port|domain|cloudflare <值>
   ngx rm <名称> [--yes] [--purge-cert]
   ngx cert issue <名称> [--email you@x] [--open-firewall]
   ngx cert renew [--dry-run]      续期（支持模拟）
@@ -652,6 +842,10 @@ ngx —— nginx 管理
   ngx top [名称] [--since 1h]     默认最近 1000 条；支持 m/h/d
   ngx backup [--with-keys]        默认不备份私钥
   ngx restore <文件>             恢复受管配置，测试通过才加载
+  ngx cf update                  下载并应用 Cloudflare IP 范围
+  ngx adopt [--dry-run]           扫描接管原站点（每次运行也会扫描）
+  ngx convert <名称> --type emby|proxy|static [add 同类选项] [--yes]
+                                 显示 diff、确认、停用原配置并转换
   ngx doctor                     常见故障诊断
   ngx help
 
@@ -662,12 +856,18 @@ ngx —— nginx 管理
 EOT
 }
 ui_add() {
-    local name type domain port upstream root tls email args=()
+    local name type domain port upstream root tls email cf only args=()
     ask name '名称: ' && ask type '类型 [emby]: ' emby && ask domain '域名（多个用逗号）: ' &&
     ask port '端口 [10618]: ' 10618 && ask upstream '上游 [127.0.0.1:18618]: ' 127.0.0.1:18618 &&
     ask root '静态目录 [/var/www/html]: ' /var/www/html && ask tls '启用 TLS？[Y/n]: ' Y && ask email '邮箱（可留空）: ' || return 1
     [[ $tls != n && $tls != N ]] || args+=(--no-tls)
     [[ -z $email ]] || args+=(--email "$email")
+    ask cf '启用 Cloudflare 模式？[y/N]: ' N || return 1
+    if [[ $cf == y || $cf == Y ]]; then
+        args+=(--cloudflare)
+        ask only '仅允许 Cloudflare 来源？[y/N]: ' N || return 1
+        [[ $only != y && $only != Y ]] || args+=(--cf-only)
+    fi
     main add "$name" --type "$type" --domain "$domain" --port "$port" --upstream "$upstream" --root "$root" "${args[@]}"
 }
 menu() {
@@ -678,18 +878,22 @@ menu() {
         echo '  enable 启用   disable 停用   set 设置   cert 证书'
         echo '  test 检查   reload 重载   restart 重启   logs 日志   top 统计'
         echo '  backup 备份   restore 恢复   install 安装   doctor 诊断   help 帮助'
+        echo '  cf 更新 CF 地址   adopt 接管   convert 转换'
         echo '  0 退出（输入上方英文命令）'
         ask choice '请选择: ' || return 0
         case $choice in
             0|q|'') return 0;;
             add) (ui_add);;
             edit|rm|show|enable|disable) ask name '名称: ' && (main "$choice" "$name");;
-            set) ask name '名称: ' && ask field '字段 upstream|port|domain: ' && ask value '值: ' && (main set "$name" "$field" "$value");;
+            set) ask name '名称: ' && ask field '字段 upstream|port|domain|cloudflare: ' && ask value '值: ' && (main set "$name" "$field" "$value");;
             cert)
                 ask mode 'issue|renew|list|rm: ' || continue
                 case $mode in issue|rm) ask name '名称: ' && (main cert "$mode" "$name");;
                     renew) if confirm '模拟续期？'; then (main cert renew --dry-run); else (main cert renew); fi;;
                     list) (main cert list);; *) err '无效选择';; esac;;
+            cf) (main cf update);;
+            adopt) if confirm '只预览？'; then (main adopt --dry-run); else (main adopt); fi;;
+            convert) ask line '名称和转换选项（例如 demo --type proxy --port 8443）: ' && { read -r -a args <<< "$line"; (main convert "${args[@]}"); };;
             logs|top) ask line '参数（空格分隔，例如 demo -n 20 或 demo --since 1h）: ' && { read -r -a args <<< "$line"; (main "$choice" "${args[@]}"); };;
             backup) if confirm '包含证书私钥？'; then (main backup --with-keys); else (main backup); fi;;
             restore) ask value '备份文件路径: ' && (main restore "$value");;
@@ -706,10 +910,21 @@ main() {
     done
     set -- "${args[@]}"
     cmd=${1:-}; (($#)) && shift
+    if [[ $cmd != adopt ]] && ! adopt_engine scan; then
+        case $cmd in help|-h|--help) warn '当前环境无法自动登记站点，仍显示帮助；可在可写环境执行 ngx adopt';; *) return 1;; esac
+    fi
+    case $cmd in status|doctor|add|set|convert|cert)
+        CF_PUBLIC4=$(curl -4 -fsS --max-time 8 https://api.ipify.org) || CF_PUBLIC4=''
+        CF_PUBLIC6=$(curl -6 -fsS --max-time 8 https://api6.ipify.org) || CF_PUBLIC6=''
+        ;;
+    esac
     case $cmd in
         '') menu;; help|-h|--help) help_text;; status) status;; install) install_ngx;;
         add) add_site "$@";; edit|rm|enable|disable|set) change_site "$cmd" "$@";;
-        show) load_site "${1:-}" && nl -ba "$ETC/sites-available/ngx-$NAME.conf";;
+        show) load_site "${1:-}" && nl -ba "$(site_file)";;
+        cf) [[ ${1:-} == update && $# == 1 ]] && cf_update;;
+        adopt) [[ $# == 0 || $# == 1 && $1 == --dry-run ]] && adopt_engine scan "${1:-}";;
+        convert) convert_site "$@";;
         cert) cert_command "$@";; test) ngtest;;
         reload) begin && finish;;
         restart) begin && ngtest && service_cmd systemctl restart nginx && finish;;
@@ -717,4 +932,420 @@ main() {
         *) err "未知命令：$cmd"; help_text; return 1;;
     esac
 }
+# ---------- Cloudflare ----------
+cf_validate() {
+    python3 - "$@" <<'PY'
+import ipaddress,sys
+try:
+    networks=[]
+    for index,path in enumerate(sys.argv[1:]):
+        lines=open(path).read().splitlines()
+        if not lines: raise ValueError('地址列表为空')
+        for line in lines:
+            if not line or line!=line.strip() or '/' not in line: raise ValueError('每行必须是 CIDR')
+            net=ipaddress.ip_network(line,strict=True)
+            if len(sys.argv)==3 and net.version!=(4 if index==0 else 6): raise ValueError('地址族错误')
+            if net.prefixlen==0: raise ValueError('不允许信任整个互联网')
+            networks.append(net)
+    networks=list(dict.fromkeys(networks))
+    if sum(n.version==4 for n in networks)<10 or not any(n.version==6 for n in networks):
+        raise ValueError('至少需要 10 条不同 IPv4 范围和 1 条 IPv6 范围')
+    print('\n'.join(map(str,networks)))
+except (OSError,ValueError) as e:
+    print('Cloudflare 地址校验失败：'+str(e),file=sys.stderr); sys.exit(1)
+PY
+}
+cf_update() {
+    begin || return 1
+    curl --proto '=https' -fsS --max-time 30 https://www.cloudflare.com/ips-v4 > "$TX/cf4" &&
+    curl --proto '=https' -fsS --max-time 30 https://www.cloudflare.com/ips-v6 > "$TX/cf6" &&
+    cf_validate "$TX/cf4" "$TX/cf6" > "$TX/cf.valid" || return 1
+    mkdir -p "$STATE" "$ETC/conf.d" "$ETC/snippets" || return 1
+    cp "$TX/cf.valid" "$STATE/cloudflare-ips.txt" || return 1
+    local range
+    {
+        echo '# managed-by: ngx'
+        while read -r range; do printf 'set_real_ip_from %s;\n' "$range"; done < "$STATE/cloudflare-ips.txt"
+        echo 'real_ip_header CF-Connecting-IP;'
+        echo 'real_ip_recursive on;'
+        echo 'geo $realip_remote_addr $ngx_cf_peer {'
+        echo '    default 0;'
+        while read -r range; do printf '    %s 1;\n' "$range"; done < "$STATE/cloudflare-ips.txt"
+        echo '}'
+    } > "$ETC/conf.d/ngx-cloudflare-realip.conf" || return 1
+    {
+        echo '# managed-by: ngx'
+        while read -r range; do printf 'allow %s;\n' "$range"; done < "$STATE/cloudflare-ips.txt"
+        echo 'deny all;'
+    } > "$ETC/snippets/ngx-cloudflare-allow.conf" || return 1
+    finish
+}
+cf_acl() {
+    [[ ${CF_ONLY:-off} == on ]] || return 0
+    printf '    include %s/snippets/ngx-cloudflare-allow.conf;\n' "$ETC"
+}
+cf_gate() {
+    [[ ${CF_ONLY:-off} == on ]] || return 0
+    cat <<'GATE'
+        # realip 已改写 $remote_addr；用原始连接地址进行来源验证。
+        # 覆盖 server 的地址 ACL，防止将真实客户端误当作非 CF 来源。
+        allow all;
+        if ($ngx_cf_peer = 0) { return 403; }
+GATE
+}
+cf_detect() {
+    local addresses public4 public6
+    addresses=$(getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u)
+    public4=${CF_PUBLIC4:-}; public6=${CF_PUBLIC6:-}
+    python3 - "$STATE/cloudflare-ips.txt" "$addresses" "$public4" "$public6" <<'PY'
+import sys,ipaddress
+cache,addresses,v4,v6=sys.argv[1:]
+try: networks=[ipaddress.ip_network(x) for x in open(cache).read().splitlines()]
+except (OSError,ValueError): networks=[]
+try: ips=[ipaddress.ip_address(x) for x in addresses.split()]
+except ValueError: ips=[]
+public=[]
+for value in (v4,v6):
+    try: public.append(ipaddress.ip_address(value))
+    except ValueError: pass
+if ips and networks and all(any(ip in net for net in networks) for ip in ips): print('橙云')
+elif ips and all(ip in public for ip in ips): print('灰云')
+else: print('其他')
+PY
+}
+cf_display() {
+    local domain
+    for domain in ${DOMAINS//,/ }; do hint "$domain：$(cf_detect "$domain")"; done
+}
+cf_warnings() {
+    local domain cloud
+    for domain in ${DOMAINS//,/ }; do
+        cloud=$(cf_detect "$domain")
+        case $cloud in
+            橙云)
+                [[ ${CLOUDFLARE:-off} == on ]] || warn "$domain：橙云但 cloudflare 模式关闭，请 ngx set $NAME cloudflare on（接管站点需先 convert）"
+                case $PORT in 443|2053|2083|2087|2096|8443) ;; *) warn "$domain：橙云不代理 HTTPS 端口 $PORT；可用 443、2053、2083、2087、2096、8443";; esac
+                if [[ $TYPE == emby ]]; then
+                    warn "$domain：Cloudflare 条款限制通过免费 CDN 传送大量视频；建议为播放节点建立灰云子域 play.$domain，类型 emby，上游 $UPSTREAM"
+                fi
+                hint "$domain：Cloudflare SSL 模式必须为 Full (strict)" ;;
+            灰云) [[ ${CLOUDFLARE:-off} != on ]] || hint "$domain：cloudflare 模式开启但当前灰云，无害；--cf-only 会拒绝直接访问" ;;
+        esac
+    done
+    return 0
+}
+install_cf_timer() {
+    local dir=$ROOT/etc/systemd/system
+    [[ $SELF =~ ^/[a-zA-Z0-9_./-]+$ ]] || { err 'systemd 服务要求 ngx 可执行文件路径不含特殊字符'; return 1; }
+    mkdir -p "$dir" || return 1
+    cat > "$dir/ngx-cf-update.service" <<UNIT
+# managed-by: ngx
+[Unit]
+Description=更新 nginx Cloudflare 地址范围
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=$SELF cf update
+UNIT
+    cat > "$dir/ngx-cf-update.timer" <<'UNIT'
+# managed-by: ngx
+[Unit]
+Description=每周更新 Cloudflare 地址范围
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+    touch "$TX/timer-changed" || return 1
+    service_cmd systemctl daemon-reload && service_cmd systemctl enable --now ngx-cf-update.timer
+}
+
+# ---------- 原配置接管：解析器不执行 nginx 配置或元数据 ----------
+adopt_engine() {
+    python3 - "$ROOT" "$@" <<'PY'
+import sys,os,re,glob,shlex,datetime,hashlib,shutil,tempfile,fcntl
+root,action,*args=sys.argv[1:]; etc=root+'/etc/nginx'; state=root+'/etc/ngx'; back=root+'/var/backups/ngx/adopted'
+def readmeta(path):
+    try: return dict(line.rstrip('\n').split('=',1) for line in open(path) if '=' in line)
+    except OSError: return {}
+def safe(path):
+    return bool(re.fullmatch(r'/[\w./-]+',path)) and '..' not in path.split('/')
+def physical(path):
+    if root and not path.startswith(root+'/'): return root+path if path.startswith('/') else etc+'/'+path
+    return path if path.startswith('/') else etc+'/'+path
+def directives(path,seen=None):
+    seen=set() if seen is None else seen
+    real=os.path.realpath(path)
+    if real in seen: return []
+    seen.add(real)
+    try:
+        text=open(path).read()
+        lex=shlex.shlex(text,posix=True,punctuation_chars='{};'); lex.whitespace_split=True; lex.commenters='#'
+        tokens=[p for t in lex for p in (list(t) if all(c in '{};' for c in t) else [t])]
+    except (OSError,ValueError): return []
+    result=[]; stack=[]; current=[]
+    for t in tokens:
+        if t=='{':
+            stack.append(current[0] if current else ''); current=[]
+        elif t=='}':
+            if stack: stack.pop()
+            current=[]
+        elif t==';':
+            if current:
+                result.append((tuple(stack),current))
+                if current[0]=='include' and len(current)>1:
+                    for f in sorted(glob.glob(physical(current[1]))):
+                        result.extend((tuple(stack)+scope,d) for scope,d in directives(f,seen))
+            current=[]
+        else: current.append(t)
+    return result
+
+def parse(file,links=''):
+    actual=file if os.path.isfile(file) else file+'.disabled'
+    rows=directives(actual); server=[d for scope,d in rows if 'server' in scope]
+    if not server: return None
+    def values(key): return list(dict.fromkeys(d[1] for d in server if d[0]==key and len(d)>1))
+    domains=list(dict.fromkeys(v for d in server if d[0]=='server_name' for v in d[1:]))
+    listens=[' '.join(d[1:]) for d in server if d[0]=='listen'] or ['80']
+    ports=[]; tlsports=[]
+    for d in listens:
+        bits=d.split(); m=re.search(r'(?:^|:)(\d+)$',bits[0])
+        if m:
+            port=m[1]; ports.append(port)
+            if 'ssl' in bits: tlsports.append(port)
+    rawups=values('proxy_pass'); upstreams=[]
+    for raw in rawups:
+        if re.match(r'^https?://',raw):
+            up=re.sub(r'^https?://','',raw)
+            if up.startswith('unix:'): up=up.split(':/',1)[0].rstrip(':')
+            else:
+                up=up.split('/',1)[0]
+                if ':' not in up: up+=':443' if raw.startswith('https:') else ':80'
+            upstreams.append(up)
+    certs=[physical(p) for p in values('ssl_certificate') if '$' not in p]
+    certname=''
+    if certs:
+        m=re.fullmatch(re.escape(root)+r'/etc/letsencrypt/live/([A-Za-z0-9][A-Za-z0-9_.-]*)/[^/]+',certs[0])
+        if m: certname=m[1]
+    def logpaths(key):
+        val=values(key)
+        if not val:
+            val=[d[1] for scope,d in directives(etc+'/nginx.conf') if 'server' not in scope and d[0]==key and len(d)>1]
+        return ','.join(physical(v) for v in val if v!='off' and not v.startswith('syslog:') and '$' not in v)
+    enabled=False
+    if file.startswith(etc+'/conf.d/'): enabled=os.path.isfile(file) and file.endswith('.conf')
+    else:
+        enabled=any(os.path.lexists(l) for l in links.split(',') if l)
+        if file.startswith(etc+'/sites-enabled/'): enabled=os.path.isfile(file)
+    result=dict(TYPE='adopted',FILE=file,LINKS=links,DOMAINS=','.join(domains),LISTENS=','.join(listens),
+                PORT=(tlsports or ports or ['80'])[0],UPSTREAM=upstreams[0] if upstreams else '',UPSTREAMS=','.join(upstreams),
+                DOCROOT=(values('root') or [''])[0],TLS='on' if certs or tlsports else 'off',CERT_PATHS=','.join(certs),
+                CERT_NAME=certname,ACCESS_LOGS=logpaths('access_log'),ERROR_LOGS=logpaths('error_log'),
+                ENABLED='on' if enabled else 'off',CREATED=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+    # 元数据每项一行；不执行内容。无法安全表示的配置拒绝接管，原文件不动。
+    if any('\n' in v or '\r' in v for v in result.values()): return None
+    return result
+
+def emit(data):
+    for k,v in data.items(): print(k+'='+v)
+def atomic(path,content):
+    fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd,'w') as f: f.write(content)
+        os.replace(tmp,path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+try:
+    if action=='parse':
+        data=parse(*args)
+        if not data: raise ValueError('无法解析 server 配置：'+args[0])
+        emit(data); sys.exit(0)
+    if action!='scan': raise ValueError('未知接管操作')
+    dry=bool(args and args[0]=='--dry-run')
+    # dry-run 和没有新站点的扫描绝不创建目录、锁、备份或元数据。
+    lock=None
+    metas={os.path.basename(p)[:-4]:readmeta(p) for p in glob.glob(state+'/sites/*.env')}
+    registered=set()
+    for name,m in metas.items():
+        for p in (m.get('FILE',''),m.get('ORIGIN_FILE',''),etc+'/sites-available/ngx-'+name+'.conf'):
+            if p: registered.add(os.path.realpath(p))
+    candidates={}
+    for folder in ('sites-enabled','sites-available','conf.d'):
+        for p in sorted(glob.glob(etc+'/'+folder+'/*')):
+            if not os.path.isfile(p): continue
+            if folder=='conf.d' and not p.endswith('.conf'): continue
+            real=os.path.realpath(p)
+            # 已替换的 Debian default 保持禁用，不再次接管。
+            if os.path.basename(real)=='default' and os.path.lexists(etc+'/ngx-default.disabled'): continue
+            if real in registered: continue
+            if '# managed-by: ngx' in open(p).read(): continue
+            if not safe(real) or not real.startswith(etc+'/'):
+                print('  ! 路径不能安全接管：'+p,file=sys.stderr); continue
+            entry=candidates.setdefault(real,[])
+            if folder=='sites-enabled': entry.append(p)
+    used=set(metas)
+    for file,links in candidates.items():
+        data=parse(file,','.join(links))
+        if not data: continue
+        stem=os.path.basename(file); stem=re.sub(r'\.conf$','',stem)
+        stem=re.sub(r'[^\w-]','_',stem,flags=re.UNICODE).strip('_-')[:50] or 'site'
+        if stem=='acme-80': stem='adopted-acme-80'
+        name=stem; index=2
+        while name in used:
+            name=stem+'-'+str(index); index+=1
+        used.add(name)
+        if dry:
+            print('  接管预览：'+name+' ← '+file); continue
+        if lock is None:
+            os.makedirs(root+'/run/lock',exist_ok=True)
+            lock=open(root+'/run/lock/ngx.lock','a'); fcntl.flock(lock,fcntl.LOCK_EX)
+        # 获锁后重新检查，避免两个自动扫描重复登记同一个原件。
+        current=[readmeta(p) for p in glob.glob(state+'/sites/*.env')]
+        if any(os.path.realpath(m.get('FILE',''))==file or os.path.realpath(m.get('ORIGIN_FILE',''))==file for m in current): continue
+        while os.path.exists(state+'/sites/'+name+'.env'):
+            name=stem+'-'+str(index); index+=1
+        os.makedirs(state+'/sites',exist_ok=True); os.makedirs(back,mode=0o700,exist_ok=True)
+        backup=back+'/'+name+'-'+hashlib.sha256(file.encode()).hexdigest()[:12]+'.conf'
+        if not os.path.exists(backup):
+            shutil.copy2(file,backup); os.chmod(backup,0o600)
+        atomic(state+'/sites/'+name+'.env',''.join(k+'='+v+'\n' for k,v in data.items()))
+        print('  ✔ 已接管 '+name+' ← '+file)
+except (OSError,ValueError) as e:
+    print('接管失败：'+str(e),file=sys.stderr); sys.exit(1)
+PY
+}
+adopted_refresh() {
+    if ! path_valid "$FILE" || [[ $FILE != "$ETC/"* ]]; then err '接管路径无效或位于 nginx 目录之外'; return 1; fi
+    local data key value
+    data=$(adopt_engine parse "$FILE" "$LINKS") || return 1
+    while IFS='=' read -r key value; do
+        case $key in TYPE|FILE|LINKS|DOMAINS|PORT|LISTENS|UPSTREAM|UPSTREAMS|DOCROOT|TLS|CERT_PATHS|CERT_NAME|ACCESS_LOGS|ERROR_LOGS|ENABLED|CREATED) printf -v "$key" '%s' "$value";; esac
+    done <<< "$data"
+}
+site_file() {
+    if [[ $TYPE == adopted ]]; then
+        if [[ -f $FILE ]]; then printf '%s' "$FILE"; else printf '%s.disabled' "$FILE"; fi
+    else printf '%s/sites-available/ngx-%s.conf' "$ETC" "$NAME"; fi
+}
+site_enabled() {
+    if [[ $TYPE == adopted ]]; then [[ $ENABLED == on ]];
+    else [[ -L $ETC/sites-enabled/ngx-$NAME.conf ]]; fi
+}
+cert_path() {
+    if [[ $TYPE == adopted ]]; then printf '%s' "${CERT_PATHS%%,*}";
+    else printf '%s/live/%s/fullchain.pem' "$LE" "$(cert_id)"; fi
+}
+adopted_save() {
+    local key
+    for key in TYPE FILE LINKS DOMAINS PORT LISTENS UPSTREAM UPSTREAMS DOCROOT TLS CERT_PATHS CERT_NAME ACCESS_LOGS ERROR_LOGS ENABLED CREATED; do
+        printf '%s=%s\n' "$key" "${!key}"
+    done > "$STATE/sites/$NAME.env"
+}
+adopted_toggle() {
+    local mode=$1 link
+    if [[ $FILE == "$ETC/conf.d/"* ]]; then
+        if [[ $mode == disable && -e $FILE ]]; then mv -- "$FILE" "$FILE.disabled" || return 1;
+        elif [[ $mode == enable && -e $FILE.disabled ]]; then mv -- "$FILE.disabled" "$FILE" || return 1; fi
+    elif [[ $FILE == "$ETC/sites-enabled/"* && ! -L $FILE ]]; then
+        # sites-enabled 中的实体配置需在显式停用时保存到 sites-available，防止 * 通配符继续加载。
+        local saved=$ETC/sites-available/adopted-$NAME.conf
+        [[ ! -e $saved ]] || { err "停用备份路径已存在：$saved"; return 1; }
+        LINKS=$FILE
+        mv -- "$FILE" "$saved" || return 1
+        FILE=$saved
+        [[ $mode != enable ]] || ln -s "$FILE" "$LINKS" || return 1
+    else
+        if [[ -z $LINKS ]]; then LINKS=$ETC/sites-enabled/$(basename "$FILE"); fi
+        local links
+        IFS=, read -r -a links <<< "$LINKS"
+        for link in "${links[@]}"; do
+            [[ $link == "$ETC/sites-enabled/"* ]] && path_valid "$link" || return 1
+            if [[ $mode == disable ]]; then
+                [[ ! -e $link && ! -L $link || -L $link ]] || { err "拒绝删除实体配置：$link"; return 1; }
+                rm -f -- "$link" || return 1
+            elif [[ ! -e $link && ! -L $link ]]; then ln -s "$FILE" "$link" || return 1;
+            elif [[ $(readlink -f -- "$link") != "$(readlink -f -- "$FILE")" ]]; then err "启用路径已被占用：$link"; return 1; fi
+        done
+    fi
+    ENABLED=off; [[ $mode != enable ]] || ENABLED=on
+    adopted_save
+}
+adopted_change() {
+    local command=$1; shift
+    case $command in
+        set) err "接管站点不支持 ngx set；请 ngx edit $NAME 或 ngx convert $NAME --type emby|proxy|static"; return 1;;
+        rm) err "接管站点保留原文件，请 ngx disable $NAME；转换后可使用 ngx rm"; return 1;;
+        edit|enable|disable) [[ $# == 0 ]] || return 1;;
+        *) return 1;;
+    esac
+    begin || return 1
+    case $command in
+        edit) "${EDITOR:-vi}" "$(site_file)" && adopted_refresh && adopted_save || return 1;;
+        enable|disable) adopted_toggle "$command" || return 1;;
+    esac
+    finish
+}
+adopted_issue() {
+    [[ -n $CERT_NAME && $CERT_PATHS != *,* ]] || { err '无法关联唯一 certbot lineage；请先 ngx convert 并指定域名'; return 1; }
+    domains_valid "$DOMAINS" || { err '接管域名含通配符或正则，HTTP-01 需要明确域名；请先转换'; return 1; }
+    # 不向原配置注入 location；它必须已经把 HTTP-01 请求交给 ngx-acme webroot。
+    hint "接管站点使用原证书 lineage $CERT_NAME 重新签发；请确保原站点 HTTP/TLS 均服务 $WEB/.well-known/acme-challenge/"
+    begin && issue && finish
+}
+convert_site() {
+    load_site "${1:-}" || return 1; shift
+    [[ $TYPE == adopted ]] || { err '仅接管站点需要转换'; return 1; }
+    local original original_file=$FILE old_name=$NAME old_links=$LINKS old_type=$TYPE candidate chosen='' arg
+    original=$(site_file)
+    # 多上游/多 TLS lineage 不能默选；要求用户指定覆盖项。
+    local domain_override=0 upstream_override=0 port_override=0
+    CLOUDFLARE=off CF_ONLY=off
+    while (($#)); do
+        arg=$1; shift
+        case $arg in
+            --type|--domain|--port|--upstream|--root|--email)
+                (($#)) || return 1
+                case $arg in --type) chosen=$1;; --domain) DOMAINS=${1,,}; domain_override=1;; --port) PORT=$1; port_override=1;; --upstream) UPSTREAM=$1; upstream_override=1;; --root) DOCROOT=$1;; --email) EMAIL=$1;; esac
+                shift;;
+            --no-tls) TLS=off; CERT_NAME='';; --cloudflare) CLOUDFLARE=on;; --cf-only) CLOUDFLARE=on CF_ONLY=on;;
+            *) err "未知转换参数：$arg"; return 1;;
+        esac
+    done
+    [[ -n $chosen ]] || { err '转换必须指定 --type'; return 1; }
+    [[ $UPSTREAMS != *,* || $upstream_override == 1 || $chosen == static ]] || { err '原配置有多个上游，请用 --upstream 明确指定'; return 1; }
+    [[ $CERT_PATHS != *,* || $domain_override == 1 ]] || { err '原配置有多个证书，请用 --domain 明确转换范围'; return 1; }
+    if [[ $PORT == 80 && $port_override == 0 ]]; then err '80 为 ACME 保留，请用 --port 指定新端口'; return 1; fi
+    TYPE=$chosen; DOCROOT=${DOCROOT:-/var/www/html}; UPSTREAM=${UPSTREAM:-127.0.0.1:18618}
+    # NGX_ROOT 下解析出的 root 可能已带测试根。
+    [[ -z $ROOT || $DOCROOT != "$ROOT/"* ]] || DOCROOT=${DOCROOT#"$ROOT"}
+    ORIGIN_FILE=$original_file
+    validate_site || return 1
+    begin || return 1
+    candidate=$TX/candidate.conf
+    local generated=$ETC/sites-available/ngx-$NAME.conf
+    [[ ! -e $generated ]] || { err '目标 ngx 配置已存在'; return 1; }
+    generate || return 1
+    mv "$generated" "$candidate" || return 1
+    diff -u --label "$original" --label "ngx-$NAME.conf（候选）" "$original" "$candidate"
+    local result=$?
+    ((result<=1)) || return 1
+    if ! ((YES)) && ! confirm '确认转换为以上配置并停用原站点？'; then
+        # 尚未修改任何原配置，无需 reload。
+        rm -rf -- "$TX"; TX=''; trap - EXIT INT TERM; return 1
+    fi
+    # 保存生成后的字段，停用原站点时仅临时切换类型。
+    TYPE=$old_type FILE=$original_file LINKS=$old_links NAME=$old_name
+    adopted_toggle disable || return 1
+    ORIGIN_FILE=$FILE; TYPE=$chosen
+    layout && cp "$candidate" "$generated" && save_site || return 1
+    ln -s "$generated" "$ETC/sites-enabled/ngx-$NAME.conf" || return 1
+    if [[ $TLS == on && ! -s $(cert_path) ]]; then
+        generate off && apply && issue && generate on || return 1
+    fi
+    finish && cf_warnings && emby_hint
+}
+
 main "$@"
