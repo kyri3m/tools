@@ -1,0 +1,720 @@
+#!/usr/bin/env bash
+# ngx —— nginx 管理；元数据仅解析，不执行。事务只恢复受管文件。
+export LC_ALL=C.UTF-8
+set -o pipefail
+shopt -s nullglob
+if [[ -t 1 ]]; then
+    R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' D=$'\e[2m' BD=$'\e[1m' N=$'\e[0m'
+else
+    R='' G='' Y='' C='' D='' BD='' N=''
+fi
+ok()    { echo "  ${G}✔${N} $*"; }
+warn()  { echo "  ${Y}!${N} $*"; }
+err()   { echo "  ${R}✘${N} $*" >&2; }
+die()   { err "$*"; exit 1; }
+hint()  { echo "  ${D}$*${N}"; }
+title() { echo; echo "${BD}${C}■ $*${N}"; }
+pad() {
+    local s=$1 w=$2 wide=${1//[[:ascii:]]/}
+    local len=$(( ${#s} + ${#wide} ))
+    printf '%s%*s' "$s" "$(( w > len ? w - len : 0 ))" ''
+}
+ask() { local answer; read -r -p "  $2" answer || return 1; printf -v "$1" '%s' "${answer:-${3:-}}"; }
+confirm() { local answer; read -r -p "  $1 [y/N] " answer || return 1; [[ $answer == y || $answer == Y ]]; }
+[[ $EUID -eq 0 ]] || die '需要 root 权限运行'
+BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=${NGX_ROOT:-}
+[[ $ROOT != / ]] || ROOT=''
+[[ -z $ROOT || $ROOT =~ ^/[a-zA-Z0-9_./-]+$ && $ROOT != *'/../'* && $ROOT != */.. ]] || die 'NGX_ROOT 必须是安全的绝对路径'
+ROOT=${ROOT%/}
+ETC=$ROOT/etc/nginx
+STATE=$ROOT/etc/ngx
+LE=$ROOT/etc/letsencrypt
+WEB=$ROOT/var/www/ngx-acme
+LOG=$ROOT/var/log/nginx
+BACK=$ROOT/var/backups/ngx
+TX='' OPEN=0 YES=0 EMAIL='' WITH_KEYS=0 PURGE=0
+# NGX_ROOT 下禁止调用真实的系统服务/防火墙命令；隔离测试必须提供 PATH 桩。
+service_cmd() {
+    local tool=$1 path; shift
+    path=$(command -v "$tool") || return 1
+    if [[ -n $ROOT && ( $path == /usr/* || $path == /bin/* || $path == /sbin/* ) ]]; then
+        err "NGX_ROOT 下拒绝调用系统 $tool；请通过 PATH 提供测试桩"; return 1
+    fi
+    "$tool" "$@"
+}
+ngtest() {
+    if [[ -n $ROOT ]]; then nginx -t -p "$ROOT/" -c "$ETC/nginx.conf"; else nginx -t; fi
+}
+apply() { ngtest && service_cmd systemctl reload nginx; }
+name_valid() { [[ $1 =~ ^[[:alnum:]][[:alnum:]_-]{0,63}$ && $1 != acme-80 ]]; }
+port_valid() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 )); }
+host_valid() {
+    local part parts
+    [[ ${#1} -le 253 && $1 != *..* && $1 != .* && $1 != *. ]] || return 1
+    IFS=. read -r -a parts <<< "$1"
+    ((${#parts[@]})) || return 1
+    for part in "${parts[@]}"; do
+        [[ ${#part} -le 63 && $part =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+    done
+}
+domains_valid() {
+    local domain domains
+    [[ -n $1 && $1 != ,* && $1 != *, && $1 != *,,* && $1 != *$'\n'* ]] || return 1
+    IFS=, read -r -a domains <<< "$1"
+    for domain in "${domains[@]}"; do host_valid "$domain" || return 1; done
+}
+path_valid() { [[ $1 =~ ^/[a-zA-Z0-9_./-]+$ && $1 != *'/../'* && $1 != */.. && $1 != *'//'* ]]; }
+upstream_valid() {
+    local host port
+    if [[ $1 == unix:* ]]; then path_valid "${1#unix:}"; return; fi
+    host=${1%:*}; port=${1##*:}
+    [[ $host != "$1" ]] && port_valid "$port" || return 1
+    if [[ $host == \[*\] ]]; then
+        python3 - "${host:1:${#host}-2}" <<'PY'
+import ipaddress,sys
+try: ipaddress.IPv6Address(sys.argv[1])
+except ValueError: sys.exit(1)
+PY
+    else host_valid "$host"; fi
+}
+email_valid() { [[ $1 =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; }
+cert_id() {
+    if [[ $NAME =~ ^[a-zA-Z0-9_-]+$ ]]; then printf 'ngx-%s' "$NAME";
+    else printf 'ngx-%s' "$(printf %s "$NAME" | sha256sum | cut -c1-24)"; fi
+}
+load_site() {
+    NAME=$1
+    name_valid "$NAME" || { err '站点名称无效'; return 1; }
+    local file=$STATE/sites/$NAME.env key value
+    [[ -f $file && ! -L $file ]] || { err "站点不存在：$NAME"; return 1; }
+    TYPE='' DOMAINS='' PORT='' UPSTREAM='' DOCROOT='' TLS='' CREATED=''
+    while IFS='=' read -r key value; do
+        case $key in
+            TYPE|DOMAINS|PORT|UPSTREAM|DOCROOT|TLS|CREATED) printf -v "$key" '%s' "$value" ;;
+            *) err "元数据字段无效：$key"; return 1 ;;
+        esac
+    done < "$file"
+    validate_site
+}
+validate_site() {
+    # shellcheck disable=SC2015 # 整条校验链失败均报告同一错误。
+    name_valid "$NAME" && [[ $TYPE == emby || $TYPE == proxy || $TYPE == static ]] &&
+    domains_valid "$DOMAINS" && port_valid "$PORT" && [[ $PORT != 80 ]] &&
+    upstream_valid "$UPSTREAM" && path_valid "$DOCROOT" && [[ $TLS == on || $TLS == off ]] &&
+    [[ $CREATED =~ ^[0-9T:Z-]+$ ]] || { err '输入无效：检查名称、类型、域名、端口（80 保留）、上游或目录'; return 1; }
+}
+save_site() {
+    printf 'TYPE=%s\nDOMAINS=%s\nPORT=%s\nUPSTREAM=%s\nDOCROOT=%s\nTLS=%s\nCREATED=%s\n' \
+        "$TYPE" "$DOMAINS" "$PORT" "$UPSTREAM" "$DOCROOT" "$TLS" "$CREATED" > "$STATE/sites/$NAME.env"
+}
+check_conflicts() {
+    local file other p ds domain data
+    for file in "$STATE"/sites/*.env; do
+        other=${file##*/}; other=${other%.env}; [[ $other == "$NAME" ]] && continue
+        p=$(sed -n 's/^PORT=//p' "$file")
+        [[ $p != "$PORT" ]] || { err "端口 $PORT 已属于 $other"; return 1; }
+        ds=$(sed -n 's/^DOMAINS=//p' "$file")
+        for domain in ${DOMAINS//,/ }; do
+            [[ ,${ds,,}, != *,${domain,,},* ]] || { err "域名 $domain 已属于 $other"; return 1; }
+        done
+    done
+    data=$(ss -H -lntp) || { err '无法读取监听端口'; return 1; }
+    if awk -v p="$PORT" '$4 ~ (":" p "$") && $0 !~ /"nginx"/ {found=1; print} END {exit !found}' <<< "$data"; then
+        err "端口 $PORT 被非 nginx 或未知进程占用"; return 1
+    fi
+}
+# 事务快照包含证书私钥，仅保存在 0700 临时目录，结束后删除。
+managed_files() {
+    local f
+    for f in "$ETC"/sites-available/ngx-* "$ETC"/sites-enabled/ngx-* "$ETC"/snippets/ngx-* "$ETC"/conf.d/ngx-* \
+        "$ETC/sites-enabled/default" "$ETC/ngx-default.disabled" "$STATE" "$LE"; do
+        [[ -e $f || -L $f ]] && printf '%s\n' "${f#"${ROOT:-/}"}" | sed 's#^/##'
+    done
+}
+begin() {
+    [[ -z $TX ]] || return 0
+    mkdir -p "$ROOT/run/lock" || return 1
+    exec 9>"$ROOT/run/lock/ngx.lock"
+    flock -n 9 || { err '另一个 ngx 修改正在进行'; return 1; }
+    TX=$(mktemp -d "$ROOT/run/ngx.XXXXXXXX") || return 1
+    chmod 700 "$TX"
+    managed_files > "$TX/files"
+    tar -czf "$TX/before.tar.gz" -C "${ROOT:-/}" -T "$TX/files" || return 1
+    trap 'rollback' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+rollback() {
+    [[ -n $TX ]] || return 0
+    local f snapshot=$TX
+    for f in "$ETC"/sites-available/ngx-* "$ETC"/sites-enabled/ngx-* "$ETC"/snippets/ngx-* "$ETC"/conf.d/ngx-* \
+        "$ETC/sites-enabled/default" "$ETC/ngx-default.disabled" "$STATE" "$LE"; do rm -rf -- "$f"; done
+    if ! tar -xzf "$snapshot/before.tar.gz" -C "${ROOT:-/}"; then
+        err "回滚解包失败，保留快照：$snapshot"; TX=''; return 1
+    fi
+    TX=''
+    if ngtest && service_cmd systemctl reload nginx; then warn '已恢复修改前配置并重新加载';
+    else err "文件已恢复，但 nginx 恢复加载失败；快照：$snapshot"; return 1; fi
+    rm -rf -- "$snapshot"
+}
+finish() {
+    apply || return 1
+    rm -rf -- "$TX"; TX=''
+    trap - EXIT INT TERM
+    ok '配置已校验并加载'
+}
+layout() {
+    mkdir -p "$ETC"/{sites-available,sites-enabled,snippets,conf.d} "$STATE/sites" "$WEB/.well-known/acme-challenge" "$LOG" || return 1
+    local f
+    for f in ngx-ssl.conf ngx-security.conf ngx-proxy.conf; do
+        [[ -f $BASE/templates/$f ]] || { err "缺少模板 $BASE/templates/$f"; return 1; }
+        cp -- "$BASE/templates/$f" "$ETC/snippets/$f" || return 1
+    done
+    cp -- "$BASE/templates/ngx-http.conf" "$ETC/conf.d/ngx-http.conf" || return 1
+    cat > "$ETC/snippets/ngx-acme.conf" <<EOT
+location ^~ /.well-known/acme-challenge/ {
+    root $WEB;
+    default_type text/plain;
+    try_files \$uri =404;
+}
+EOT
+    if [[ -e $ETC/sites-enabled/default || -L $ETC/sites-enabled/default ]]; then
+        [[ ! -e $ETC/ngx-default.disabled && ! -L $ETC/ngx-default.disabled ]] || { err 'default 备份已存在，请先人工检查'; return 1; }
+        mv -- "$ETC/sites-enabled/default" "$ETC/ngx-default.disabled" || return 1
+        warn 'Debian default 已备份为 /etc/nginx/ngx-default.disabled'
+    fi
+    cat > "$ETC/sites-available/ngx-acme-80.conf" <<EOT
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    access_log $LOG/ngx-acme-80.access.log ngx;
+    error_log $LOG/ngx-acme-80.error.log;
+    include $ETC/snippets/ngx-acme.conf;
+    location / { return 404; }
+}
+EOT
+    ln -sfn "$ETC/sites-available/ngx-acme-80.conf" "$ETC/sites-enabled/ngx-acme-80.conf"
+}
+generate() {
+    local live=${1:-$TLS} cert target scheme
+    cert=$(cert_id); scheme=http; [[ $live == on ]] && scheme=https
+    target=$UPSTREAM
+    [[ $target != unix:* ]] || target="unix:$ROOT${target#unix:}:"
+    cat > "$ETC/sites-available/ngx-$NAME.conf" <<EOT
+# 由 ngx 管理；ngx set 会从元数据重新生成，覆盖手工编辑。
+server {
+    listen $PORT$([[ $live == on ]] && printf ' ssl');
+    listen [::]:$PORT$([[ $live == on ]] && printf ' ssl');
+    server_name ${DOMAINS//,/ };
+    access_log $LOG/ngx-$NAME.access.log ngx;
+    error_log $LOG/ngx-$NAME.error.log;
+    include $ETC/snippets/ngx-security.conf;
+EOT
+    if [[ $live == on ]]; then
+        cat >> "$ETC/sites-available/ngx-$NAME.conf" <<EOT
+    http2 on;
+    ssl_certificate $LE/live/$cert/fullchain.pem;
+    ssl_certificate_key $LE/live/$cert/privkey.pem;
+    include $ETC/snippets/ngx-ssl.conf;
+EOT
+    fi
+    if [[ $TYPE == static ]]; then
+        cat >> "$ETC/sites-available/ngx-$NAME.conf" <<EOT
+    root $ROOT$DOCROOT;
+    location / { try_files \$uri \$uri/ =404; }
+EOT
+    else
+        if [[ $TYPE == emby ]]; then
+            cat >> "$ETC/sites-available/ngx-$NAME.conf" <<'EOT'
+    # EmbyHub 的 /embywebsocket 和 /socket 使用共享 WebSocket upgrade。
+    # 上传通常很小，client_max_body_size 100m，避免无限制上传。
+    # 应用在自己的公网 URL 发出到 /node/v1/stream 的绝对 307，无须重写。
+EOT
+        fi
+        cat >> "$ETC/sites-available/ngx-$NAME.conf" <<EOT
+    location / {
+        include $ETC/snippets/ngx-proxy.conf;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass http://$target;
+    }
+EOT
+    fi
+    cat >> "$ETC/sites-available/ngx-$NAME.conf" <<EOT
+}
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAINS//,/ };
+    include $ETC/snippets/ngx-acme.conf;
+    location / { return 301 $scheme://\$host:$PORT\$request_uri; }
+}
+EOT
+}
+firewall_state() {
+    local output
+    output=$(service_cmd fw status 2>/dev/null) || { echo 未知; return; }
+    # shellcheck disable=SC2001 # ANSI 转义序列需要正则。
+    output=$(sed $'s/\033\\[[0-9;]*m//g' <<< "$output")
+    if awk -v p="$1" '$1=="tcp" {split($2,a,"-"); if(a[1] ~ /^[0-9]+$/ && p>=a[1]+0 && p<=(a[2]?a[2]:a[1])+0) f=1} END {exit !f}' <<< "$output"; then
+        echo 已开放
+    else echo 未知; fi
+}
+offer_firewall() {
+    [[ $(firewall_state "$1") != 已开放 ]] || return 0
+    if (( OPEN )); then service_cmd fw open "$1" tcp "ngx $NAME";
+    elif [[ -t 0 ]] && confirm "是否运行 fw open $1 tcp nginx？"; then service_cmd fw open "$1" tcp "ngx $NAME";
+    else hint "需要外网访问时请执行：fw open $1 tcp nginx（也请检查云安全组）"; fi
+}
+certbot_cmd() {
+    service_cmd certbot --config-dir "$LE" --work-dir "$ROOT/var/lib/letsencrypt" --logs-dir "$ROOT/var/log/letsencrypt" "$@"
+}
+cert_preflight() {
+    local ipv4 ipv6 domain ips addr found
+    ipv4=$(curl -4 -fsS --max-time 8 https://api.ipify.org) || ipv4=''
+    ipv6=$(curl -6 -fsS --max-time 8 https://api6.ipify.org) || ipv6=''
+    [[ -n $ipv4 || -n $ipv6 ]] || { err '无法获取本机公网 IP，无法验证 DNS'; return 1; }
+    for domain in ${DOMAINS//,/ }; do
+        ips=$(getent ahosts "$domain" | awk '{print $1}' | sort -u)
+        [[ -n $ips ]] || { err "$domain 无 A/AAAA 解析"; return 1; }
+        found=0
+        while read -r addr; do
+            if [[ $addr == "$ipv4" || $addr == "$ipv6" ]]; then found=1;
+            else err "$domain 的地址 $addr 不属于本机公网 IP；检查 A/AAAA、NAT 和 Cloudflare 灰云（仅 DNS）"; return 1; fi
+        done <<< "$ips"
+        ((found)) || return 1
+    done
+    offer_firewall 80 || return 1
+    [[ $(firewall_state 80) == 已开放 ]] || { err '无法确认 fw 已放行 TCP/80；请运行 fw status / fw open 80 tcp ACME'; return 1; }
+    hint 'HTTP-01 还需云安全组/NAT 放行公网 TCP/80；本机检查不能证明外网可达，最终以 ACME 验证为准。Cloudflare 请使用灰云。'
+}
+issue() {
+    cert_preflight || return 1
+    local args=() domain email=$EMAIL
+    if [[ -z $email && -f $STATE/config ]]; then email=$(sed -n 's/^EMAIL=//p' "$STATE/config"); fi
+    if [[ -n $email ]]; then email_valid "$email" || { err '邮箱格式无效'; return 1; }; args+=(--email "$email");
+    else warn '未设置邮箱，将使用 --register-unsafely-without-email，无法接收账户通知'; args+=(--register-unsafely-without-email); fi
+    for domain in ${DOMAINS//,/ }; do args+=(-d "$domain"); done
+    certbot_cmd certonly --non-interactive --agree-tos --webroot -w "$WEB" --cert-name "$(cert_id)" \
+        --deploy-hook 'systemctl reload nginx' "${args[@]}" || return 1
+    [[ -s $LE/live/$(cert_id)/fullchain.pem && -s $LE/live/$(cert_id)/privkey.pem ]] || { err 'certbot 未生成证书'; return 1; }
+    [[ -z $email ]] || printf 'EMAIL=%s\n' "$email" > "$STATE/config"
+}
+emby_hint() {
+    [[ $TYPE == emby ]] || return 0
+    local scheme=http; [[ $TLS == on ]] && scheme=https
+    title 'EmbyHub 应用设置（仅提示，不修改应用）'
+    hint '.env：MEDIA_HTTP_TRUSTED_PROXIES=127.0.0.1,::1'
+    hint "系统 → 设置 → 中心公网地址：$scheme://${DOMAINS%%,*}:$PORT"
+    hint "内置节点也使用此公网 URL；执行 cli node register-center --rotate，或在管理后台更新。"
+}
+add_site() {
+    NAME=${1:-}; (($#)) && shift
+    TYPE=emby DOMAINS='' PORT=10618 UPSTREAM=127.0.0.1:18618 DOCROOT=/var/www/html TLS=on CREATED=$(date -u +%FT%TZ)
+    while (($#)); do
+        case $1 in
+            --type|--domain|--port|--upstream|--root|--email)
+                (($#>=2)) || { err "缺少 $1 的值"; return 1; }
+                case $1 in --type) TYPE=$2;; --domain) DOMAINS=${2,,};; --port) PORT=$2;; --upstream) UPSTREAM=$2;; --root) DOCROOT=$2;; --email) EMAIL=$2;; esac
+                shift 2 ;;
+            --no-tls) TLS=off; shift ;;
+            *) err "未知参数：$1"; return 1 ;;
+        esac
+    done
+    validate_site && { [[ -z $EMAIL ]] || email_valid "$EMAIL"; } || return 1
+    [[ ! -e $STATE/sites/$NAME.env && ! -e $ETC/sites-available/ngx-$NAME.conf ]] || { err '站点已存在'; return 1; }
+    begin && check_conflicts && layout && save_site && generate off || return 1
+    ln -s "$ETC/sites-available/ngx-$NAME.conf" "$ETC/sites-enabled/ngx-$NAME.conf" || return 1
+    apply || return 1
+    if [[ $TLS == on ]]; then issue && generate on || return 1; fi
+    finish || return 1
+    offer_firewall "$PORT" || return 1
+    emby_hint
+}
+change_site() {
+    local command=$1; shift
+    load_site "${1:-}" || return 1; shift
+    local was_enabled=0
+    [[ -L $ETC/sites-enabled/ngx-$NAME.conf ]] && was_enabled=1
+    case $command in
+        rm)
+            ((YES)) || confirm "删除站点 $NAME？证书默认保留" || return 1 ;;
+        set)
+            [[ $# == 2 ]] || { err '用法：ngx set <名称> upstream|port|domain <值>'; return 1; }
+            case $1 in upstream) UPSTREAM=$2;; port) PORT=$2;; domain) DOMAINS=${2,,};; *) err '字段无效'; return 1;; esac
+            validate_site || return 1 ;;
+        *) [[ $# == 0 ]] || { err '多余参数'; return 1; } ;;
+    esac
+    begin || return 1
+    case $command in
+        edit) "${EDITOR:-vi}" "$ETC/sites-available/ngx-$NAME.conf" || return 1 ;;
+        enable) check_conflicts && ln -sfn "$ETC/sites-available/ngx-$NAME.conf" "$ETC/sites-enabled/ngx-$NAME.conf" || return 1 ;;
+        disable) rm -f -- "$ETC/sites-enabled/ngx-$NAME.conf" || return 1 ;;
+        rm)
+            rm -f -- "$ETC/sites-enabled/ngx-$NAME.conf" "$ETC/sites-available/ngx-$NAME.conf" "$STATE/sites/$NAME.env" || return 1
+            apply || return 1
+            if ((PURGE)); then certbot_cmd delete --non-interactive --cert-name "$(cert_id)" || return 1; fi ;;
+        set)
+            check_conflicts || return 1
+            if [[ $1 == domain && $TLS == on ]]; then
+                ((was_enabled)) || { err 'TLS 域名变更需先启用站点以完成 HTTP-01'; return 1; }
+                # 保留旧 HTTPS 服务；签发期间通过 catch-all 提供新域名挑战。
+                issue || return 1
+            fi
+            save_site && generate || return 1 ;;
+    esac
+    finish
+}
+cert_days() {
+    local expiry epoch
+    expiry=$(openssl x509 -in "$LE/live/$(cert_id)/fullchain.pem" -noout -enddate 2>/dev/null) || { echo '?'; return; }
+    epoch=$(date -d "${expiry#notAfter=}" +%s) || { echo '?'; return; }
+    echo "$(( (epoch - $(date +%s)) / 86400 ))"
+}
+reachable() {
+    [[ $TYPE != static ]] || { echo '-'; return; }
+    if [[ $UPSTREAM == unix:* ]]; then
+        if python3 - "$ROOT${UPSTREAM#unix:}" <<'PY'
+import socket,sys
+s=socket.socket(socket.AF_UNIX); s.settimeout(1)
+try: s.connect(sys.argv[1])
+except OSError: sys.exit(1)
+finally: s.close()
+PY
+        then echo ✓; else echo ✗; fi
+    else
+        local host=${UPSTREAM%:*} port=${UPSTREAM##*:}
+        host=${host#[}; host=${host%]}
+        # shellcheck disable=SC2016 # 参数由子 bash 展开。
+        if timeout 1 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null; then echo ✓; else echo ✗; fi
+    fi
+}
+status() {
+    title 'nginx 概况'
+    service_cmd systemctl is-active nginx
+    service_cmd systemctl is-enabled nginx
+    nginx -v 2>&1
+    ngtest
+    hint "worker 数：$(ps -eo args= | awk '/^nginx: worker process/ {n++} END {print n+0}')"
+    ss -lntp
+    title '站点'
+    printf '  %s%s%s%s%s%s\n' "$(pad 名称 18)" "$(pad 类型 9)" "$(pad 域名 28)" "$(pad 端口 8)" "$(pad 上游 27)" '探测  TLS剩余天  启用  防火墙'
+    local file enabled days colour
+    for file in "$STATE"/sites/*.env; do
+        load_site "$(basename "$file" .env)" || continue
+        enabled=否; [[ -L $ETC/sites-enabled/ngx-$NAME.conf ]] && enabled=是
+        days='-'; colour=$D
+        if [[ $TLS == on ]]; then days=$(cert_days); colour=$G; [[ $days == '?' ]] && colour=$R; [[ $days != '?' ]] && ((days<14)) && colour=$Y; fi
+        printf '  %s%s%s%s%s%s  %s%s%s  %s  %s\n' "$(pad "$NAME" 18)" "$(pad "$TYPE" 9)" "$(pad "$DOMAINS" 28)" "$(pad "$PORT" 8)" "$(pad "$UPSTREAM" 27)" "$(reachable)" "$colour" "$days" "$N" "$enabled" "$(firewall_state "$PORT")"
+    done
+    title '外部站点（只读）'
+    for file in "$ETC"/sites-available/* "$ETC"/sites-enabled/*; do
+        [[ ${file##*/} == ngx-* ]] || hint "$file（外部）"
+    done
+    title 'certbot 定时任务下次运行'
+    service_cmd systemctl list-timers --all certbot.timer --no-pager
+}
+cert_command() {
+    local action=${1:-}; (($#)) && shift
+    case $action in
+        issue)
+            load_site "${1:-}" || return 1; shift
+            if [[ ${1:-} == --email && $# == 2 ]]; then EMAIL=$2; shift 2; fi
+            [[ $# == 0 ]] || { err '证书签发参数无效'; return 1; }
+            [[ -L $ETC/sites-enabled/ngx-$NAME.conf ]] || { err '请先启用站点'; return 1; }
+            begin && issue || return 1
+            TLS=on
+            save_site && generate && finish ;;
+        renew)
+            [[ $# == 0 || $# == 1 && $1 == --dry-run ]] || return 1
+            begin && ngtest && certbot_cmd renew "$@" --deploy-hook 'systemctl reload nginx' && finish ;;
+        list)
+            local file days expiry
+            for file in "$STATE"/sites/*.env; do
+                load_site "$(basename "$file" .env)" || continue
+                days=$(cert_days)
+                expiry=$(openssl x509 -in "$LE/live/$(cert_id)/fullchain.pem" -noout -enddate 2>/dev/null) || expiry=无证书
+                printf '%s  %s  %s  剩余 %s 天\n' "$NAME" "$DOMAINS" "$expiry" "$days"
+            done
+            certbot_cmd certificates ;;
+        rm)
+            NAME=${1:-}; name_valid "$NAME" || return 1
+            if [[ -f $STATE/sites/$NAME.env ]]; then
+                load_site "$NAME" || return 1
+                [[ $TLS != on ]] || { err '站点仍引用 TLS 证书；请先删除站点（禁用站点也保留引用）'; return 1; }
+            fi
+            ((YES)) || confirm "删除 $NAME 的证书？" || return 1
+            begin && certbot_cmd delete --non-interactive --cert-name "$(cert_id)" && finish ;;
+        *) err '用法：ngx cert issue|renew|list|rm'; return 1 ;;
+    esac
+}
+backup() {
+    mkdir -p "$BACK" || return 1
+    local file
+    file=$BACK/$(date -u +%Y%m%dT%H%M%S)-$$.tar.gz
+    # 不跟随符号链接；默认排除私钥内容（也包括 nginx 目录中的自定义私钥）。
+    python3 - "${ROOT:-/}" "$file" "$WITH_KEYS" <<'PY'
+import os,sys,tarfile
+root,dest,keys=sys.argv[1:]; keys=keys=='1'
+def select(info):
+    if not keys and info.isfile():
+        with open(os.path.join(root,info.name),'rb') as f:
+            if b'PRIVATE KEY-----' in f.read(): return None
+    return info
+with tarfile.open(dest,'w:gz') as t:
+    for p in ['etc/nginx','etc/ngx']+(['etc/letsencrypt'] if keys else []):
+        if os.path.lexists(os.path.join(root,p)): t.add(os.path.join(root,p),arcname=p,filter=select)
+os.chmod(dest,0o600)
+print(dest)
+PY
+}
+restore() {
+    local archive=${1:-} stage
+    [[ -f $archive ]] || { err '备份文件不存在'; return 1; }
+    begin || return 1
+    stage=$TX/restore
+    mkdir -p "$stage"
+    # 验证 tar 成员，禁止目录穿越、硬链接、设备、链接父目录；仅恢复 ngx 管理对象。
+    python3 - "$archive" "$stage" "$ROOT" <<'PY' || return 1
+import os,sys,tarfile,pathlib
+archive,stage,root=sys.argv[1:]
+def managed(n):
+    p=pathlib.PurePosixPath(n)
+    return (n=='etc/ngx' or n.startswith('etc/ngx/') or n=='etc/letsencrypt' or n.startswith('etc/letsencrypt/') or
+            len(p.parts)==4 and p.parts[:2]==('etc','nginx') and p.parts[2] in ('sites-available','sites-enabled','snippets','conf.d') and p.name.startswith('ngx-'))
+try:
+    with tarfile.open(archive,'r:gz') as t:
+        members=t.getmembers(); names=set(); links=set()
+        for m in members:
+            p=pathlib.PurePosixPath(m.name)
+            if p.is_absolute() or '..' in p.parts or m.name in names: raise ValueError('不安全或重复的归档路径')
+            names.add(m.name)
+            if not (m.isdir() or m.isfile() or m.issym()): raise ValueError('不支持的归档成员类型')
+            if m.issym(): links.add(m.name)
+        for m in members:
+            if any(str(p) in links for p in pathlib.PurePosixPath(m.name).parents): raise ValueError('归档路径经过符号链接')
+            if not managed(m.name): continue
+            if m.issym():
+                # ngx 链接只允许 sites-enabled；证书链接仅允许相对 archive 目录。
+                if m.name.startswith('etc/nginx/sites-enabled/ngx-'):
+                    target=root+'/etc/nginx/sites-available/'+pathlib.PurePosixPath(m.name).name
+                elif m.name.startswith('etc/letsencrypt/live/') and not os.path.isabs(m.linkname):
+                    target=m.linkname
+                    resolved=os.path.normpath(os.path.join(os.path.dirname(m.name),target))
+                    if not resolved.startswith('etc/letsencrypt/archive/'): raise ValueError('证书链接越界')
+                else: raise ValueError('受管目录内不允许此符号链接')
+                dest=os.path.join(stage,m.name); os.makedirs(os.path.dirname(dest),exist_ok=True); os.symlink(target,dest)
+            else: t.extract(m,stage,filter='data')
+    if not os.path.isdir(stage+'/etc/ngx/sites'): raise ValueError('不是 ngx 备份')
+except (ValueError,OSError,tarfile.TarError) as e:
+    print('恢复被拒绝：'+str(e),file=sys.stderr); sys.exit(1)
+PY
+    local f
+    for f in "$ETC"/sites-available/ngx-* "$ETC"/sites-enabled/ngx-* "$ETC"/snippets/ngx-* "$ETC"/conf.d/ngx-*; do rm -f -- "$f" || return 1; done
+    rm -rf -- "$STATE" || return 1
+    cp -a "$stage/etc/ngx" "$STATE" || return 1
+    for f in sites-available sites-enabled snippets conf.d; do
+        mkdir -p "$ETC/$f"
+        if [[ -d $stage/etc/nginx/$f ]]; then cp -a "$stage/etc/nginx/$f/." "$ETC/$f/" || return 1; fi
+    done
+    if [[ -d $stage/etc/letsencrypt ]]; then
+        rm -rf -- "$LE" && cp -a "$stage/etc/letsencrypt" "$LE" || return 1
+    fi
+    # 先校验磁盘候选配置，再切换运行配置；失败时事务恢复。
+    finish
+}
+logs() {
+    local name='' follow=0 kind=access count=50 args=() file
+    while (($#)); do
+        case $1 in
+            -f) follow=1; shift;; --error) kind=error; shift;;
+            -n) [[ $# -ge 2 && $2 =~ ^[1-9][0-9]*$ ]] || return 1; count=$2; shift 2;;
+            -*) err '日志参数无效'; return 1;;
+            *) [[ -z $name ]] || return 1; name=$1; name_valid "$name" || return 1; shift;;
+        esac
+    done
+    [[ -z $name ]] || load_site "$name" || return 1
+    if [[ -n $name ]]; then args+=("$LOG/ngx-$name.$kind.log");
+    else for file in "$LOG"/ngx-*."$kind".log; do args+=("$file"); done; fi
+    ((${#args[@]})) || { hint '暂无日志'; return 0; }
+    if ((follow)); then tail -n "$count" -F -- "${args[@]}"; else tail -n "$count" -- "${args[@]}"; fi
+}
+top_stats() {
+    local name='' since=''
+    while (($#)); do
+        case $1 in --since) [[ $# -ge 2 && $2 =~ ^[1-9][0-9]*[mhd]$ ]] || return 1; since=$2; shift 2;;
+            *) [[ -z $name ]] && name_valid "$1" || return 1; name=$1; shift;; esac
+    done
+    [[ -z $name ]] || load_site "$name" || return 1
+    python3 - "$LOG" "$name" "$since" <<'PY'
+import sys,glob,re,datetime,collections
+folder,name,since=sys.argv[1:]; files=glob.glob(folder+'/ngx-'+(name or '*')+'.access.log')
+cutoff=None
+if since: cutoff=datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(seconds=int(since[:-1])*{'m':60,'h':3600,'d':86400}[since[-1]])
+rows=[]
+for f in files:
+    with open(f,errors='replace') as stream:
+        lines=stream if since else collections.deque(stream,maxlen=1000)
+        for line in lines:
+            m=re.match(r'(\S+) \S+ \S+ \[([^]]+)\] "\S+ (\S+) [^"]*" (\d{3}) (\d+)',line)
+            if not m: continue
+            ip,stamp,path,status,size=m.groups()
+            try: date=datetime.datetime.strptime(stamp,'%d/%b/%Y:%H:%M:%S %z')
+            except ValueError: continue
+            if cutoff and date<cutoff: continue
+            rows.append((date,ip,path,status,int(size)))
+if not since: rows=sorted(rows,key=lambda r:r[0])[-1000:]
+print('请求数：',len(rows),'  字节：',sum(r[4] for r in rows))
+for label,index in [('状态码',3),('来源 IP',1),('请求路径',2)]:
+    print(label)
+    for value,count in collections.Counter(r[index] for r in rows).most_common(10): print(' ',count,value)
+PY
+}
+doctor() {
+    local problems=0 file days
+    title 'nginx 诊断'
+    ngtest || { err '配置校验失败'; problems=1; }
+    if [[ -e $ETC/sites-enabled/default || -L $ETC/sites-enabled/default ]]; then warn 'Debian default 仍启用，请运行 ngx install'; problems=1; fi
+    [[ $(firewall_state 80) == 已开放 ]] || { warn '无法确认 TCP/80 放行，请检查 fw status 和云安全组'; problems=1; }
+    local duplicates dump_args=()
+    [[ -z $ROOT ]] || dump_args=(-p "$ROOT/" -c "$ETC/nginx.conf")
+    duplicates=$(nginx -T "${dump_args[@]}" 2>/dev/null | python3 -c '
+import sys,shlex,collections
+lexer=shlex.shlex(sys.stdin,posix=True,punctuation_chars="{};")
+lexer.whitespace_split=True; lexer.commenters="#"
+tokens=(piece for token in lexer for piece in (list(token) if all(c in "{};" for c in token) else [token]))
+# 只统计同一 server 直接声明的名称与监听端点；HTTP/HTTPS 共用域名不是重复。
+depth=0; servers=[]; current=None; directive=[]; seen=collections.Counter()
+for token in tokens:
+    if token=="{":
+        depth+=1
+        if directive==["server"]: current={"depth":depth,"names":[],"listen":[]}
+        directive=[]
+    elif token=="}":
+        if current and current["depth"]==depth:
+            servers.append(current); current=None
+        depth-=1; directive=[]
+    elif token==";":
+        if current and depth==current["depth"] and directive:
+            if directive[0]=="server_name": current["names"].extend(directive[1:])
+            if directive[0]=="listen" and len(directive)>1: current["listen"].append(directive[1])
+        directive=[]
+    else: directive.append(token)
+for server in servers:
+    for endpoint in server["listen"] or ["80"]:
+        if endpoint.isdecimal(): endpoint="0.0.0.0:"+endpoint
+        for name in server["names"]: seen[endpoint,name.lower()]+=1
+for (endpoint,name),count in seen.items():
+    if count>1: print(endpoint,name)
+')
+    [[ -z $duplicates ]] || { warn "重复 server_name：$duplicates"; problems=1; }
+    for file in "$STATE"/sites/*.env; do
+        load_site "$(basename "$file" .env)" || { problems=1; continue; }
+        if [[ $(reachable) == ✗ ]]; then warn "$NAME 上游不可达：$UPSTREAM"; problems=1; fi
+        if [[ $TLS == on ]]; then
+            days=$(cert_days)
+            if [[ $days == '?' ]] || ((days<14)); then warn "$NAME 证书剩余 $days 天"; problems=1; fi
+            if ! grep -Eq '^deploy_hook *= *systemctl reload nginx$' "$LE/renewal/$(cert_id).conf" 2>/dev/null; then
+                warn "$NAME 缺少续期 deploy hook，请 ngx cert issue $NAME"; problems=1
+            fi
+        fi
+    done
+    ((problems==0)) && ok '未发现上述常见问题'
+    return "$problems"
+}
+install_ngx() {
+    if ! command -v nginx >/dev/null || ! command -v certbot >/dev/null; then
+        [[ -z $ROOT ]] || { err '测试根目录不允许 apt 安装，请提供命令桩'; return 1; }
+        apt-get update && apt-get install -y nginx certbot || return 1
+    fi
+    begin && layout && apply && service_cmd systemctl enable --now certbot.timer && finish
+}
+help_text() {
+    cat <<'EOT'
+ngx —— nginx 管理
+
+  ngx                            交互菜单
+  ngx status                     概况、站点、上游、证书与防火墙
+  ngx install                    安装依赖、共享配置、ACME 入口和定时任务
+  ngx add <名称> --type emby|proxy|static --domain d1[,d2]
+      [--port 10618] [--upstream 127.0.0.1:18618] [--root /var/www/x]
+      [--no-tls] [--email you@x] [--open-firewall]
+  ngx edit|show|enable|disable <名称>
+  ngx set <名称> upstream|port|domain <值>
+  ngx rm <名称> [--yes] [--purge-cert]
+  ngx cert issue <名称> [--email you@x] [--open-firewall]
+  ngx cert renew [--dry-run]      续期（支持模拟）
+  ngx cert list                  列出证书
+  ngx cert rm <名称> [--yes]      删除未被站点引用的证书
+  ngx test|reload|restart
+  ngx logs [名称] [-f] [--error] [-n N]
+  ngx top [名称] [--since 1h]     默认最近 1000 条；支持 m/h/d
+  ngx backup [--with-keys]        默认不备份私钥
+  ngx restore <文件>             恢复受管配置，测试通过才加载
+  ngx doctor                     常见故障诊断
+  ngx help
+
+名称支持中文、字母、数字、下划线、连字符；80 专用于 ACME。
+修改会校验并加载，失败则回滚。set 覆盖手工编辑。rm 默认保留证书。
+非交互模式仅 --open-firewall 会运行 fw open；不直接操作 nftables。
+--yes 用于删除确认；备份和恢复需要可信归档；详见 README.md。
+EOT
+}
+ui_add() {
+    local name type domain port upstream root tls email args=()
+    ask name '名称: ' && ask type '类型 [emby]: ' emby && ask domain '域名（多个用逗号）: ' &&
+    ask port '端口 [10618]: ' 10618 && ask upstream '上游 [127.0.0.1:18618]: ' 127.0.0.1:18618 &&
+    ask root '静态目录 [/var/www/html]: ' /var/www/html && ask tls '启用 TLS？[Y/n]: ' Y && ask email '邮箱（可留空）: ' || return 1
+    [[ $tls != n && $tls != N ]] || args+=(--no-tls)
+    [[ -z $email ]] || args+=(--email "$email")
+    main add "$name" --type "$type" --domain "$domain" --port "$port" --upstream "$upstream" --root "$root" "${args[@]}"
+}
+menu() {
+    local choice name field value mode line args
+    while true; do
+        title 'ngx nginx 管理'
+        echo '  status 状态   add 添加   edit 编辑   rm 删除   show 查看'
+        echo '  enable 启用   disable 停用   set 设置   cert 证书'
+        echo '  test 检查   reload 重载   restart 重启   logs 日志   top 统计'
+        echo '  backup 备份   restore 恢复   install 安装   doctor 诊断   help 帮助'
+        echo '  0 退出（输入上方英文命令）'
+        ask choice '请选择: ' || return 0
+        case $choice in
+            0|q|'') return 0;;
+            add) (ui_add);;
+            edit|rm|show|enable|disable) ask name '名称: ' && (main "$choice" "$name");;
+            set) ask name '名称: ' && ask field '字段 upstream|port|domain: ' && ask value '值: ' && (main set "$name" "$field" "$value");;
+            cert)
+                ask mode 'issue|renew|list|rm: ' || continue
+                case $mode in issue|rm) ask name '名称: ' && (main cert "$mode" "$name");;
+                    renew) if confirm '模拟续期？'; then (main cert renew --dry-run); else (main cert renew); fi;;
+                    list) (main cert list);; *) err '无效选择';; esac;;
+            logs|top) ask line '参数（空格分隔，例如 demo -n 20 或 demo --since 1h）: ' && { read -r -a args <<< "$line"; (main "$choice" "${args[@]}"); };;
+            backup) if confirm '包含证书私钥？'; then (main backup --with-keys); else (main backup); fi;;
+            restore) ask value '备份文件路径: ' && (main restore "$value");;
+            status|test|reload|restart|install|doctor|help) (main "$choice");;
+            *) err '无效选择';;
+        esac
+        read -r -s -p "  ${D}按回车返回菜单…${N}" line || return 0; echo
+    done
+}
+main() {
+    local args=() arg cmd
+    for arg in "$@"; do
+        case $arg in --open-firewall) OPEN=1;; --yes) YES=1;; --purge-cert) PURGE=1;; --with-keys) WITH_KEYS=1;; *) args+=("$arg");; esac
+    done
+    set -- "${args[@]}"
+    cmd=${1:-}; (($#)) && shift
+    case $cmd in
+        '') menu;; help|-h|--help) help_text;; status) status;; install) install_ngx;;
+        add) add_site "$@";; edit|rm|enable|disable|set) change_site "$cmd" "$@";;
+        show) load_site "${1:-}" && nl -ba "$ETC/sites-available/ngx-$NAME.conf";;
+        cert) cert_command "$@";; test) ngtest;;
+        reload) begin && finish;;
+        restart) begin && ngtest && service_cmd systemctl restart nginx && finish;;
+        logs) logs "$@";; top) top_stats "$@";; backup) backup;; restore) restore "$@";; doctor) doctor;;
+        *) err "未知命令：$cmd"; help_text; return 1;;
+    esac
+}
+main "$@"
