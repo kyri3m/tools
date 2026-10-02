@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # 由 run.sh source，共用其隔离根、断言函数和桩。
 # shellcheck disable=SC2016
+# Safety: these tests write fixtures under $NGX_ROOT. Refuse to run without an
+# isolated root, otherwise they would land in the real /etc (this happened once
+# when followup.sh was run directly instead of being sourced by run.sh).
+if [[ -z ${NGX_ROOT:-} || ${NGX_ROOT%/} == "" ]]; then
+    echo "拒绝运行：未设置隔离的 NGX_ROOT（请执行 bash test/run.sh）" >&2
+    exit 2
+fi
 cat > "$TMP/cf4" <<'RANGES'
 173.245.48.0/20
 103.21.244.0/22
