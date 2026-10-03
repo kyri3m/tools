@@ -24,10 +24,12 @@ path=folder+'/records.json'
 records=json.load(open(path)) if os.path.exists(path) else []
 if method=='GET':
  from urllib.parse import parse_qs,urlparse
- name=parse_qs(urlparse(url).query).get('name',[None])[0]
- emit([r for r in records if not name or r['name']==name]); sys.exit()
+ query=parse_qs(urlparse(url).query); name=query.get('name',[None])[0]
+ rows=[r for r in records if not name or r['name']==name]
+ size=int(query.get('per_page',['100'])[0]); page=int(query.get('page',['1'])[0])
+ emit(rows[(page-1)*size:page*size],result_info={'total_pages':max(1,(len(rows)+size-1)//size)}); sys.exit()
 if method=='POST':
- payload['id']='r'+str(len(records)+1); records.append(payload); result=payload
+ payload['id']='r'+str(max([int(r['id'][1:]) for r in records if r['id'].startswith('r') and r['id'][1:].isdigit()]+[0])+1); records.append(payload); result=payload
 elif method in ('PUT','PATCH'):
  id=url.split('/')[-1]; result=next(r for r in records if r['id']==id); result.update(payload)
 elif method=='DELETE':
@@ -89,6 +91,189 @@ BEFORE=$(wc -l < "$TMP/api-calls")
 ) > "$TMP/output"
 [[ $(wc -l < "$TMP/api-calls") == "$BEFORE" ]]
 report 'dashboard / 网站详情 / 手写标记 / 无原始输出 / CF 缓存'
+
+# DNS 管理测试使用独立记录集，结束后恢复网站原记录。
+cp "$TMP/records.json" "$TMP/dns-original"
+run dns list example.test
+contains "$TMP/output" '类型'
+contains "$TMP/output" '· 网站 v3'
+run dns list
+contains "$TMP/output" 'example.test'
+run dns add a.example.test A 203.0.113.8 --ttl 60 --proxied on
+run dns add aaaa.example.test AAAA 2001:db8::8
+run dns add alias.example.test CNAME a.example.test
+run dns add txt.example.test TXT 'value "quoted" with spaces'
+run dns add flags.example.test TXT --dns
+run dns edit flags.example.test TXT --content --yes
+run dns rm flags.example.test TXT --yes
+run dns add example.test MX mail.example.test --priority 20
+run dns add _sip._tcp.example.test SRV '10 5 5060 sip.example.test'
+run dns add example.test CAA '0 issue letsencrypt.org'
+run dns add delegated.example.test NS ns.example.test
+run dns list example.test
+contains "$TMP/output" 'value "quoted" with spaces'
+contains "$TMP/output" '10 5 5060 sip.example.test'
+contains "$TMP/output" '0 issue letsencrypt.org'
+contains "$TMP/output" '20 mail.example.test'
+contains "$TMP/output" '自动'
+contains "$TMP/output" '—'
+python3 - "$TMP/records.json" <<'PY'
+import json,sys
+rows=json.load(open(sys.argv[1]))
+assert {r['type'] for r in rows}=={'A','AAAA','CNAME','TXT','MX','SRV','CAA','NS'}
+assert next(r for r in rows if r['type']=='SRV')['data']==dict(service='_sip',proto='_tcp',name='example.test',priority=10,weight=5,port=5060,target='sip.example.test')
+assert next(r for r in rows if r['type']=='CAA')['data']==dict(flags=0,tag='issue',value='letsencrypt.org')
+PY
+BEFORE=$(wc -l < "$TMP/api-calls")
+reject dns add outside.invalid A 203.0.113.8
+reject dns add 'bad".example.test' TXT injection
+reject dns add a.example.test SOA bad
+reject dns add a.example.test A '203.0.113.8","proxied":true'
+reject dns add a.example.test A 2001:db8::8
+reject dns add a.example.test AAAA 203.0.113.8
+reject dns add a.example.test CNAME 'bad host'
+reject dns add a.example.test CNAME 203.0.113.8
+reject dns add a.example.test TXT $'control\ncharacter'
+reject dns add a.example.test MX mail.example.test
+reject dns add a.example.test MX mail.example.test --priority 65536
+reject dns add a.example.test SRV '0 0 443 target.example.test'
+reject dns add _sip._tcp.example.test SRV '0 0 bad target.example.test'
+reject dns add a.example.test CAA '999 issue letsencrypt.org'
+reject dns add a.example.test NS bad/hostname
+reject dns add a.example.test TXT value --proxied on
+reject dns add a.example.test A 203.0.113.8 --ttl 59
+reject dns add a.example.test A 203.0.113.8 --ttl 86401
+reject dns add a.example.test A 203.0.113.8 --ttl '1","content":"injected'
+reject dns add a.example.test A 203.0.113.8 --proxied maybe
+reject dns edit a.example.test A --id '../bad' --ttl 300
+# 校验失败不能写入 API。
+sed -n "$((BEFORE+1)),\$p" "$TMP/api-calls" > "$TMP/dns-invalid-calls"
+if grep -Eq '^(POST|PATCH|PUT|DELETE) ' "$TMP/dns-invalid-calls"; then echo '无效输入写入 API'; exit 1; fi
+run dns edit a.example.test A --content 203.0.113.9 --ttl 86400 --proxied off
+run dns edit txt.example.test TXT --content 'new "quoted" value' --ttl 300
+python3 - "$TMP/records.json" <<'PY'
+import json,sys
+rows=json.load(open(sys.argv[1])); a=next(r for r in rows if r['name']=='a.example.test')
+assert a['content']=='203.0.113.9' and a['ttl']==86400 and not a['proxied']
+txt=next(r for r in rows if r['type']=='TXT'); assert txt['content']=='new "quoted" value' and txt['ttl']==300
+PY
+reject dns edit a.example.test A --ttl 30
+run dns add a.example.test A 203.0.113.10
+reject dns edit a.example.test A --ttl 300
+contains "$TMP/output" '多个记录匹配'
+contains "$TMP/output" '--id'
+reject dns rm a.example.test A --yes
+ID=$(python3 -c 'import json,sys; print(next(r for r in json.load(open(sys.argv[1])) if r["name"]=="a.example.test")["id"])' "$TMP/records.json")
+run dns edit a.example.test A --id "$ID" --ttl 300
+if printf 'n\n' | "$BASE/ngx" dns rm a.example.test A --id "$ID" > "$TMP/output" 2>&1; then echo '拒绝确认后不应删除'; exit 1; fi
+printf 'y\n' | "$BASE/ngx" dns rm a.example.test A --id "$ID" > "$TMP/output" 2>&1
+contains "$TMP/output" 'rm 成功'
+run dns rm txt.example.test TXT --yes
+if printf 'n\n' | "$BASE/ngx" dns edit v3.example.test A --content 203.0.113.5 > "$TMP/output" 2>&1; then echo '网站记录应要求确认'; exit 1; fi
+contains "$TMP/output" '删除会使网站无法访问'
+printf 'y\n' | "$BASE/ngx" dns edit v3.example.test A --content 203.0.113.5 > "$TMP/output" 2>&1
+printf 'y\n' | "$BASE/ngx" dns edit v3.example.test A --proxied off > "$TMP/output" 2>&1
+contains "$NGX_ROOT/etc/ngx/sites/v3.env" 'CLOUDFLARE=off'
+printf 'y\n' | "$BASE/ngx" dns edit v3.example.test A --proxied on > "$TMP/output" 2>&1
+contains "$NGX_ROOT/etc/ngx/sites/v3.env" 'CLOUDFLARE=on'
+if printf 'n\n' | "$BASE/ngx" dns rm v3.example.test A > "$TMP/output" 2>&1; then echo '网站删除应确认'; exit 1; fi
+contains "$TMP/output" '· 网站 v3'
+contains "$TMP/output" '删除会使网站无法访问'
+report 'DNS 全类型添加 / JSON 和类型校验 / 内容、TTL、代理编辑 / 重名 --id / 删除确认 / 网站警告和联动'
+# 测 UI：域名列表、无 Token、向导默认值及编辑菜单。
+(
+    # shellcheck source=/dev/null
+    source "$TMP/functions"
+    pause() { :; }
+    ui_cloudflare <<< 0
+    ui_dns_add example.test <<'INPUT'
+1
+wizard
+
+
+
+y
+INPUT
+    ui_dns_add example.test <<'INPUT'
+5
+@
+mail.example.test
+10
+
+y
+INPUT
+    ui_dns_add example.test <<'INPUT'
+6
+CAA
+example.test
+0 issue letsencrypt.org
+
+y
+INPUT
+) > "$TMP/output" 2>&1
+contains "$TMP/output" 'Cloudflare · Token …1234'
+contains "$TMP/output" '条解析'
+contains "$TMP/output" 'wizard.example.test · A · add 成功'
+contains "$TMP/output" 'example.test · MX · add 成功'
+contains "$TMP/output" 'example.test · CAA · add 成功'
+# 同 dashboard 的显示宽度对齐：中文 TXT、根域名和网站标记。
+(
+    # shellcheck source=/dev/null
+    source "$TMP/functions"
+    dns_site() { [[ $1 != example.test ]] || echo 中文网站; return 0; }
+    dns_table example.test '[{"id":"align1","type":"TXT","name":"example.test","content":"中文 text","ttl":1},{"id":"align2","type":"A","name":"emby.example.test","content":"203.0.113.8","proxied":true,"ttl":300}]'
+) > "$TMP/dns-alignment"
+python3 - "$TMP/dns-alignment" <<'PY'
+import sys,unicodedata
+cells=[['序号','类型','名称','内容','代理','TTL'],['1','TXT','@ · 网站 中文网站','中文 text','—','自动'],['2','A','emby','203.0.113.8','橙云','300']]
+def width(s):
+ return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ('W','F') else 1 for c in s)
+widths=[max(width(row[i]) for row in cells) for i in range(6)]
+expected=['   '+'  '.join(c+' '*(w-width(c)) for c,w in zip(row,widths)) for row in cells]
+assert open(sys.argv[1]).read().splitlines()==expected
+PY
+# 101 条记录同时覆盖 API 分页和 UI 的第 20/21 条边界。
+python3 - "$TMP/records.json" <<'PY'
+import json,sys
+json.dump([dict(id='page'+str(i),name='page'+str(i)+'.example.test',type='A',content='203.0.113.8',proxied=False,ttl=1) for i in range(1,102)],open(sys.argv[1],'w'))
+PY
+(
+    # shellcheck source=/dev/null
+    source "$TMP/functions"
+    pause() { :; }
+    ui_dns_zone zone1 example.test <<'INPUT'
+n
+21
+3
+300
+p
+0
+INPUT
+) > "$TMP/output" 2>&1
+contains "$TMP/output" '2/6 页'
+contains "$TMP/output" 'page20'
+contains "$TMP/output" 'page21'
+contains "$TMP/output" 'page40'
+contains "$TMP/output" '修改内容'
+contains "$TMP/api-calls" 'per_page=100&page=2'
+python3 - "$TMP/records.json" <<'PY'
+import json,sys
+rows=json.load(open(sys.argv[1])); assert len(rows)==101 and rows[20]['ttl']==300
+PY
+(
+    # shellcheck source=/dev/null
+    source "$TMP/functions"
+    STATE=$TMP/no-token
+    ui_cloudflare <<< 0
+) > "$TMP/output" 2>&1
+contains "$TMP/output" '还没添加 Token'
+contains "$TMP/output" 't) 添加 Token'
+contains "$TMP/output" 'My Profile → API Tokens'
+contains "$TMP/output" 'Zone.DNS Edit + Zone.Zone Read'
+if grep -Fq "$V3_TOKEN" "$TMP/output" "$TMP/api-calls"; then echo 'DNS UI Token 泄漏'; exit 1; fi
+cp "$TMP/dns-original" "$TMP/records.json"
+rm -rf "$NGX_ROOT/etc/ngx/cache"
+report 'Cloudflare 域名列表 / 向导 A 默认 IP、MX 和 CAA / API 与 UI 分页 / 管理菜单 / 无 Token 提示 / Token 不泄漏'
 
 # 强制颜色，覆盖中英文、手写标记、不同状态及证书长度。
 (
@@ -337,6 +522,7 @@ if grep -Fq "$V3_TOKEN" "$TMP/output" "$TMP/calls" "$TMP/api-calls"; then echo '
 run cf token rm
 [[ ! -e $NGX_ROOT/etc/ngx/cloudflare.token ]]
 reject cf token test
+reject dns list example.test
 (
     # shellcheck source=/dev/null
     source "$TMP/functions"

@@ -87,19 +87,19 @@ contains "$TMP/output" 'Full (strict)'
 contains "$TMP/output" 'Cloudflare 条款限制'
 contains "$TMP/output" 'play.orange.example.test'
 run set cf cloudflare off
-contains "$TMP/output" '橙云但 cloudflare 模式关闭'
+contains "$TMP/output" '橙云但 Cloudflare 模式关闭'
 contains "$CF_SITE" 'proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;'
 run set cf cloudflare on --cf-only
 contains "$CF_SITE" 'proxy_set_header X-Forwarded-For $remote_addr;'
 contains "$CF_SITE" 'ngx-cloudflare-allow.conf;'
 run add cfonly --type proxy --domain cfonly.example.test --port 2053 --cf-only
-contains "$TMP/output" 'cloudflare 模式开启但当前灰云'
+contains "$TMP/output" 'Cloudflare 模式开启但当前灰云'
 run add orangebad --domain orange6.example.test --port 10620 --no-tls > /dev/null 2>&1 && { echo '域名重复应拒绝'; exit 1; }
 # 使用新域名以避免与 cf 站点发生域名冲突。
 echo 'orangemedia.example.test 173.245.48.6' >> "$TMP/dns"
 run add orangebad --domain orangemedia.example.test --port 10620 --no-tls
 contains "$TMP/output" '橙云不代理 HTTPS 端口 10620'
-contains "$TMP/output" '橙云但 cloudflare 模式关闭'
+contains "$TMP/output" '橙云但 Cloudflare 模式关闭'
 run add other --type static --domain other.example.test,mixed.example.test --port 12011 --no-tls
 run status
 contains "$TMP/output" 'orange.example.test：橙云'

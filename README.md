@@ -49,7 +49,7 @@ ngx                # 进入网站面板
    1 emby  ● 在线    emby.example.com  剩 89 天      灰云
    2 blog  ○ 已停用  blog.example.com  未启用 HTTPS  橙云
   ─────────────────────────────────────────────────────────
-   1-9) 管理网站   n) 新建网站   c) Cloudflare 设置
+   1-9) 管理网站   n) 新建网站   c) Cloudflare
    d) 一键体检     b) 备份恢复   0) 退出
 ```
 
@@ -60,6 +60,7 @@ fw open 8443 tcp                       # 放行 TCP 端口
 fw block 203.0.113.10                   # 封禁来源 IP
 ngx add web --type proxy --domain web.example.com --port 443 --upstream 127.0.0.1:8080  # 新建反向代理网站
 ngx cf token set                       # 隐藏输入 Cloudflare Token
+ngx dns add emby.example.com A 203.0.113.5 --proxied off  # 添加域名解析
 ngx                                    # 选网站 → 8，切换橙云/灰云（橙云用 Full (strict)）
 ngx doctor                             # 一键体检
 ngx backup                             # 普通备份，默认排除 Token 和私钥

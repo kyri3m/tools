@@ -2,6 +2,8 @@
 
 单文件 Bash 脚本，中文界面。适用于 Debian 12/13（nftables）。需要 root。
 
+交互页面仅在终端输出且 `TERM` 非 `dumb` 时清屏，操作结果按 Enter 后返回；`FW_NO_CLEAR=1` 禁用清屏，CLI 和管道输出不清屏。
+
 ## 安装
 
 ```bash

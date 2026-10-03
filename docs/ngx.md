@@ -2,6 +2,8 @@
 
 适用于 Debian 13、apt nginx 1.26、certbot 4。Bash 单文件，中文界面，配色和 CJK 表格与 `fw` 一致。需要 root；依赖 Bash、Python 3.12+、openssl、curl、getent、iproute2、util-linux、tar 和 systemd。四份基础模板已内嵌，不依赖旁边的目录。
 
+交互页面仅在终端输出且 `TERM` 非 `dumb` 时清屏，操作结果按 Enter 后返回；`NGX_NO_CLEAR=1` 禁用清屏，CLI 和管道输出不清屏。
+
 ## 安装与 EmbyHub
 
 ```bash
@@ -37,7 +39,7 @@ Emby 模板支持 HTTP/2、WebSocket、Range/If-Range，关闭代理缓冲和缓
    1 emby     ● 在线     emby.example.com     剩 89 天         灰云
    2 blog     ○ 已停用   blog.example.com     未启用 HTTPS     橙云
   ─────────────────────────────────────────────────────────
-   1-9) 管理网站   n) 新建网站   c) Cloudflare 设置
+   1-9) 管理网站   n) 新建网站   c) Cloudflare
    d) 一键体检     b) 备份恢复   0) 退出
 ```
 
@@ -79,7 +81,7 @@ HTTPS 子菜单支持立即重新签发、模拟续期和开关 HTTPS；关闭�
 | `backup` | `ngx backup`；`ngx backup --with-keys`：包含证书及私钥 |
 | `restore` | `ngx restore /var/backups/ngx/20261002T120000-123.tar.gz` |
 | `cf token` | `ngx cf token set`：隐藏输入；`test` 验证；`zones` 列域名；`rm` 删除 |
-| `dns` | `ngx dns list web`；`ngx dns set web --proxied off`：创建或更新公网 A/AAAA |
+| `dns` | `list [zone或网站]` 查看域名全部解析；`set web` 更新公网 A/AAAA；`add/edit/rm` 管理解析 |
 | `cert issue --dns` | `ngx cert issue web --dns`：Cloudflare DNS-01，不需要 80 |
 | `cert off` | `ngx cert off web`：关闭 HTTPS，保留证书 |
 | `cf update` | `ngx cf update`：校验并更新官方地址范围、realip 和限源配置 |
@@ -111,6 +113,24 @@ ngx cert renew --dry-run
 ```
 
 DNS set 默认保持已有记录的代理状态，新记录默认灰云；已有 CNAME 或同类型多个记录时要求先在控制台处理。详情页云朵切换使用 PATCH 保留 DNS 地址。橙云请使用 Full (strict)。
+
+`c) Cloudflare` 显示 Token 末四位、每周 IP 同步状态和域名解析条数。`t` 管理 Token，`s` 同步 IP 段，域名序号进入解析页。解析表按可见字符宽度对齐，显示类型、短名称（根域名为 `@`）、内容、代理和 TTL，每页 20 条，`n/p` 翻页；序号在分页间连续。`a` 添加解析，回车采用根域名、A/AAAA 本机公网 IP、灰云和自动 TTL。名称可填相对名称或当前域名下的完整名称，相对名称自动补上当前域名。
+
+```bash
+ngx dns list                         # 查看所有授权域名的全部解析
+ngx dns list example.com             # 也可填写该域名下的完整记录名称或 ngx 网站名称
+ngx dns add emby.example.com A 203.0.113.5 --proxied off --ttl 300
+ngx dns add example.com MX mail.example.com --priority 10
+ngx dns add _sip._tcp.example.com SRV '10 5 5060 sip.example.com'
+ngx dns add example.com CAA '0 issue letsencrypt.org'
+ngx dns edit emby.example.com A --content 203.0.113.6 --ttl 1
+ngx dns edit emby.example.com A --proxied on --id RECORD_ID
+ngx dns rm emby.example.com A         # 展示记录后确认；--yes 跳过删除确认
+```
+
+CLI 添加、编辑、删除采用完整记录名称，必须在 Token 授权的域名内。支持 A、AAAA、CNAME、TXT、MX、SRV、CAA、NS；IP 和目标主机名按类型校验，TXT 保留引号和空格。SRV 名称采用 `_service._tcp/udp/tls.域名`，内容是 `priority weight port target`；CAA 是 `flags tag value`（tag 支持 issue、issuewild、iodef）。MX 新建必须指定 `--priority`（0–65535）；只有 A/AAAA/CNAME 支持橙云。TTL 为 `1`（自动）或 `60–86400` 秒。编辑未指定的字段保持原值；同名称、类型匹配多条时会列出记录和 ID，必须用 `--id` 选择，避免误改误删。
+
+匹配 ngx 网站域名的记录标记 `· 网站 <名称>`。修改前警告并确认，删除明确提示会破坏访问（自动化删除可用 `--yes`）。切换关联记录的代理会询问是否通过网站云朵操作，让该网站全部域名的 DNS 和 nginx 一起切换，并复用失败回滚；非交互调用需提供确认输入。多个网站共用同一记录时，先分别在网站页调整。接管的手写网站须先升级为标准配置才能联动切换。
 
 DNS-01 优先使用已安装的 certbot Cloudflare 插件，以 0600 临时文件传凭据，签发后删除；没有插件时使用 ngx 内置 manual auth/cleanup hooks，创建独立 TXT、等待 60 秒传播、只清理本次挑战记录。`CERT_METHOD=dns` 保存在网站元数据中，后续域名修改继续用 DNS-01。续期配置统一使用持久的 ngx hooks 读取当前 Token，避免引用已删除的插件临时凭据；无需插件继续安装，也无需开放 80。ngx 可执行文件需要保持原路径，移动后重新 `cert issue --dns` 更新 hooks。Token 通过 curl 标准输入传递，不放在进程参数中。
 

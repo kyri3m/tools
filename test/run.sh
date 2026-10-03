@@ -240,6 +240,8 @@ report 'logs / top / doctor'
 source "$BASE/test/followup.sh"
 # shellcheck source=test/v3.sh
 source "$BASE/test/v3.sh"
+# shellcheck source=test/ui.sh
+source "$BASE/test/ui.sh"
 # 用真实 nginx 解析所有模板、TLS、IPv6、静态站点、proxy；绝不 reload 系统服务。
 cat > "$TMP/nginx.conf" <<CONF
 user root;

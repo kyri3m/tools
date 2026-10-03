@@ -676,9 +676,17 @@ confirm() { # 默认 Yes
 	read -rp "  $1 [Y/n] " a || return 1
 	[[ -z $a || $a =~ ^[Yy] ]]
 }
-pause() { read -rsp "  ${D}按回车返回菜单…${N}" _; echo; }
+FW_UI_MODE=0
+ui_stdout_tty() { [[ -t 1 ]]; }
+ui_clear() {
+	[[ ${FW_UI_MODE:-0} == 1 && ${FW_NO_CLEAR:-0} != 1 && ${TERM:-dumb} != dumb ]] && ui_stdout_tty || return 0
+	if command -v clear >/dev/null 2>&1 && clear -x 2>/dev/null; then return 0; fi
+	printf '\e[H\e[2J\e[3J'
+}
+pause() { local _; printf '  %s按回车返回菜单…%s' "$D" "$N"; read -rs _ || true; echo; }
 
 ui_open() {
+	ui_clear
 	title "放行端口"
 	load_listeners
 	local l lp lport lscope lproc shown=0
@@ -702,6 +710,7 @@ ui_open() {
 }
 
 ui_close() {
+	ui_clear
 	title "关闭端口"
 	local rows=() row i=0 proto port note
 	mapfile -t rows < <(grep . "$PORTS")
@@ -734,6 +743,7 @@ ui_close() {
 }
 
 ui_block() {
+	ui_clear
 	title "封禁 IP"
 	hint "支持单个 IP（1.2.3.4）或网段（1.2.3.0/24、2001:db8::/32）"
 	local ip note
@@ -747,6 +757,7 @@ ui_block() {
 }
 
 ui_unblock() {
+	ui_clear
 	title "解封 IP"
 	local rows=() row i=0 ip note
 	mapfile -t rows < <(awk 'NF {print $1, "黑名单", $0}' "$BLOCKS"; f2b_banned | awk '{print $1, "fail2ban"}')
@@ -770,6 +781,7 @@ ui_unblock() {
 }
 
 ui_trust() {
+	ui_clear
 	title "添加白名单（始终放行）"
 	hint "白名单里的 IP 可以访问本机所有端口，也不会被 fail2ban 封禁"
 	local me
@@ -786,6 +798,7 @@ ui_trust() {
 }
 
 ui_untrust() {
+	ui_clear
 	title "移出白名单"
 	local rows=() row i=0 ip note
 	mapfile -t rows < <(grep . "$ALLOWS")
@@ -810,13 +823,13 @@ ui_untrust() {
 
 menu() {
 	trap 'echo; exit 130' INT
-	local c nports nblk nalw nban
+	local c nports nblk nalw nban FW_UI_MODE=1
 	while true; do
 		nports=$(grep -c . "$PORTS")
 		nblk=$(grep -c . "$BLOCKS")
 		nalw=$(grep -c . "$ALLOWS")
 		nban=$(f2b_banned | grep -c .)
-		clear
+		ui_clear
 		echo
 		echo "  ${BD}${C}fw 防火墙管理${N}   ${D}$(hostname)${N}"
 		if nft list table inet host >/dev/null 2>&1; then
@@ -834,16 +847,16 @@ menu() {
 		echo
 		read -rp "  请选择: " c || { echo; exit 0; }
 		case $c in
-			1) cmd_status; pause ;;
+			1) ui_clear; cmd_status; pause ;;
 			2) ui_open; echo; pause ;;
 			3) ui_close; echo; pause ;;
 			4) ui_block; echo; pause ;;
 			5) ui_unblock; echo; pause ;;
 			6) ui_trust; echo; pause ;;
 			7) ui_untrust; echo; pause ;;
-			8) cmd_log 30; pause ;;
-			9) cmd_bans; pause ;;
-			r|R) echo; cmd_reload; echo; pause ;;
+			8) ui_clear; cmd_log 30; pause ;;
+			9) ui_clear; cmd_bans; pause ;;
+			r|R) ui_clear; echo; cmd_reload; echo; pause ;;
 			0|q|Q|'') echo; exit 0 ;;
 			*) ;;
 		esac

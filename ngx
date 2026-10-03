@@ -926,10 +926,14 @@ ngx —— nginx 管理
   ngx backup [--with-keys]        默认不备份私钥
   ngx restore <文件>             恢复受管配置，测试通过才加载
   ngx cf token set|test|rm|zones  管理 Cloudflare Token（set 隐藏输入）
-  ngx dns list|set <名称> [--proxied on|off]
+  ngx dns set <网站名称> [--proxied on|off]  创建或更新公网 A/AAAA
   ngx cert issue <名称> --dns     DNS-01，无需放行 80
   ngx cert hook <名称>            补上现有证书的续期加载 hook
   ngx cert off <名称>             关闭 HTTPS，保留证书
+  ngx dns list [zone|name]        查看域名全部解析（也接受网站名称）
+  ngx dns add <name> <type> <content> [--proxied on|off] [--ttl N] [--priority N]
+  ngx dns edit <name> <type> [--id ID] [--content X] [--proxied on|off] [--ttl N]
+  ngx dns rm <name> <type> [--id ID] [--yes]
   ngx cf update                  下载并应用 Cloudflare IP 范围
   ngx adopt [--dry-run]           扫描接管原站点（每次运行也会扫描）
   ngx convert <名称> --type emby|proxy|static [add 同类选项] [--yes]
@@ -944,7 +948,14 @@ ngx —— nginx 管理
 EOT
 }
 # ---------- 按意图管理网站 ----------
-pause() { local answer; read -r -s -p '  按回车返回…' answer || true; echo; }
+# 只在交互页面绘制时调用；CLI 的 title/status 不会清屏。
+ui_stdout_tty() { [[ -t 1 ]]; }
+ui_clear() {
+    [[ ${UI_MODE:-0} == 1 && ${NGX_NO_CLEAR:-0} != 1 && ${TERM:-dumb} != dumb ]] && ui_stdout_tty || return 0
+    if command -v clear >/dev/null 2>&1 && clear -x 2>/dev/null; then return 0; fi
+    printf '\e[H\e[2J\e[3J'
+}
+pause() { local answer; printf '  按回车返回…'; read -r -s answer || true; echo; }
 confirm_y() { local answer; read -r -p "  $1 [Y/n] " answer || return 1; [[ -z $answer || $answer == y || $answer == Y ]]; }
 site_names() { local f; for f in "$STATE"/sites/*.env; do f=${f##*/}; printf '%s\n' "${f%.env}"; done; }
 site_field() { sed -n "s/^$2=//p" "$STATE/sites/$1.env" 2>/dev/null | head -1; }
@@ -976,6 +987,7 @@ ui_findings() {
         sed $'s/\033\\[[0-9;]*m//g' | sed -n 's/^  [!✘] //p' | ui_words
 }
 ui_dashboard() {
+    ui_clear
     local names findings count health state i tag col width
     local cells=(网站 状态 域名 证书 Cloudflare) widths=(0 0 0 0 0)
     mapfile -t names < <(site_names)
@@ -1002,7 +1014,7 @@ ui_dashboard() {
             "$(pad "${cells[i+4]}" "${widths[4]}")"
     done
     echo '  ─────────────────────────────────────────────────────────'
-    echo '   1-9) 管理网站   n) 新建网站   c) Cloudflare 设置'
+    echo '   1-9) 管理网站   n) 新建网站   c) Cloudflare'
     echo '   d) 一键体检     b) 备份恢复   0) 退出'
     ((${#names[@]}<=9)) || hint '也可输入大于 9 的网站编号'
 }
@@ -1020,6 +1032,7 @@ print(format(count,','))
 PY
 }
 ui_site_render() {
+    ui_clear
     load_site "$1" >/dev/null 2>&1 || return 1
     title "$NAME · $DOMAINS                         $(ui_status_label)"
     hint "后端地址 ${UPSTREAM:-$DOCROOT} · HTTPS $(ui_cert_label) · $(ui_cloud_state "${DOMAINS%%,*}") · 今日请求 $(ui_today)"
@@ -1070,7 +1083,9 @@ ui_site() {
     done
 }
 ui_cert() {
+    ui_clear
     local name=$1 choice args=()
+    title "$name · HTTPS 证书"
     echo '   1) 重新签发/立即续期   2) 模拟续期   3) 开启 HTTPS   4) 关闭 HTTPS   0) 返回'
     ask choice '请选择: ' || return 0
     case $choice in
@@ -1124,6 +1139,7 @@ ui_cloud_toggle() {
     [[ $mode != on ]] || hint 'Cloudflare SSL 模式请选择 Full (strict)'
 }
 ui_add() {
+    ui_clear
     local choice type domain name port backend directory https=on dns=未修改 cloud=灰云 args=() zone
     title '新建网站'
     echo '   1) EmbyHub   2) 其他服务   3) 静态网页'
@@ -1177,21 +1193,144 @@ ui_add() {
     hint "证书：$(ui_cert_label) · DNS：$dns · Cloudflare：$(ui_cloud_state "$domain")"
     emby_hint
 }
-ui_cloudflare() {
-    local choice token='未设置' value
-    if [[ -f $STATE/cloudflare.token ]]; then IFS= read -r value < "$STATE/cloudflare.token"; token="…${value: -4}"; fi
-    title "Cloudflare 设置 · Token $token"
-    value=未运行; service_cmd systemctl is-active --quiet ngx-cf-update.timer >/dev/null 2>&1 && value=运行中
-    hint "每周 IP 同步：$value"
-    echo '   1) 添加/更换 Token   2) 测试 Token   3) 删除 Token'
-    echo '   4) 查看可管理的域名  5) 同步 Cloudflare IP 段   0) 返回'
+ui_cf_token() {
+    ui_clear
+    local choice
+    title 'Cloudflare · Token 管理'
+    echo '   1) 添加/更换   2) 测试   3) 删除   0) 返回'
     ask choice '请选择: ' || return 0
     case $choice in
-        1) cf_token set;; 2) cf_token test;; 3) confirm '删除 Token？DNS 续期将暂停' && cf_token rm;;
-        4) cf_token zones;; 5) ui_run cf update;;
+        1) cf_token set;; 2) cf_token test;;
+        3) confirm '删除 Token？DNS 续期将暂停' && cf_token rm;;
     esac
 }
+ui_dns_add() {
+    ui_clear
+    local zone=$1 choice kind name content default='' proxy=off ttl priority='' payload cloud='—' ttl_label
+    title "$zone · 添加解析"
+    echo '   1) A   2) AAAA   3) CNAME   4) TXT   5) MX   6) 其他 SRV/CAA/NS'
+    ask choice '类型: ' || return 0
+    case $choice in
+        1) kind=A;; 2) kind=AAAA;; 3) kind=CNAME;; 4) kind=TXT;; 5) kind=MX;;
+        6) ask kind '类型 SRV/CAA/NS: ' || return 0; kind=${kind^^}; [[ $kind =~ ^(SRV|CAA|NS)$ ]] || { err '类型无效'; return 1; };;
+        *) err '类型无效'; return 1;;
+    esac
+    [[ $kind != SRV ]] || hint 'SRV 名称格式：_service._tcp/udp/tls（例如 _sip._tcp）'
+    ask name '名称 [@]: ' @ || return 0
+    name=${name,,}; name=${name%.}
+    if [[ $name == @ ]]; then name=$zone
+    elif [[ $name != "$zone" && $name != *."$zone" ]]; then name="$name.$zone"; fi
+    case $kind in
+        A) default=$(curl -4 -fsS --max-time 8 https://api.ipify.org) || default='';;
+        AAAA) default=$(curl -6 -fsS --max-time 8 https://api6.ipify.org) || default='';;
+        SRV) hint '内容格式：priority weight port target';;
+        CAA) hint '内容格式：flags tag value（例如 0 issue letsencrypt.org）';;
+    esac
+    ask content "内容${default:+ [$default]}: " "$default" || return 0
+    [[ $kind != MX ]] || ask priority 'MX priority [10]: ' 10 || return 0
+    case $kind in A|AAAA|CNAME)
+        ask choice '橙云？[y/N]: ' n || return 0
+        case $choice in y|Y) proxy=on;; n|N) ;; *) err '请输入 y 或 n'; return 1;; esac;;
+    esac
+    ask ttl 'TTL [自动，1]: ' 1 || return 0
+    payload=$(dns_payload "$zone" "$name" "$kind" "$content" "$proxy" "$ttl" "$priority" '') || return 1
+    # 用经过校验的数据呈现摘要，确认前不写入。
+    case $kind in A|AAAA|CNAME) cloud=灰云; [[ $proxy != on ]] || cloud=橙云;; esac
+    ttl_label=$ttl; [[ $ttl != 1 ]] || ttl_label=自动
+    hint "$kind · $name · $content · $cloud · TTL $ttl_label${priority:+ · priority $priority}"
+    confirm '创建该解析？' || return 0
+    dns_manage add "$name" "$kind" "$content" --proxied "$proxy" --ttl "$ttl" ${priority:+--priority "$priority"}
+}
+ui_dns_record() {
+    ui_clear
+    local zone=$1 data=$2 index=$3 choice row name kind id content ttl proxy
+    row=$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])[int(sys.argv[2])-1]))' "$data" "$index") || return 1
+    name=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<< "$row")
+    kind=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["type"])' <<< "$row")
+    id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<< "$row")
+    title "$name · $kind"
+    dns_table "$zone" "[$row]" 0 1
+    echo '   1) 修改内容   2) 橙云/灰云切换   3) 修改 TTL   4) 删除   0) 返回'
+    ask choice '请选择: ' || return 0
+    case $choice in
+        1)
+            case $kind in SRV) hint 'priority weight port target';; CAA) hint 'flags tag value';; esac
+            ask content '新内容: ' || return 0
+            [[ -n $content ]] || { err '内容不能为空'; return 1; }
+            dns_manage edit "$name" "$kind" '' --id "$id" --content "$content";;
+        2)
+            [[ $kind =~ ^(A|AAAA|CNAME)$ ]] || { err '该类型不支持橙云'; return 1; }
+            proxy=$(python3 -c 'import json,sys; print("off" if json.load(sys.stdin).get("proxied") else "on")' <<< "$row")
+            dns_manage edit "$name" "$kind" '' --id "$id" --proxied "$proxy";;
+        3) ask ttl 'TTL [自动，1]: ' 1 || return 0; dns_manage edit "$name" "$kind" '' --id "$id" --ttl "$ttl";;
+        4) dns_manage rm "$name" "$kind" '' --id "$id";;
+    esac
+}
+ui_dns_zone() {
+    local zone=$1 name=$2 data choice page=0 count pages
+    while true; do
+        ui_clear
+        data=$(cf_record_data "$zone") || return 1
+        count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' <<< "$data")
+        pages=$(((count+19)/20)); ((pages>0)) || pages=1
+        ((page<pages)) || page=$((pages-1))
+        title "$name · DNS · $((page+1))/$pages 页"
+        dns_table "$name" "$data" "$((page*20))" 20
+        echo '   a) 添加解析   <number>) 管理该解析   n) 下一页   p) 上一页   0) 返回'
+        ask choice '请选择: ' || return 0
+        case $choice in
+            0) return 0;; a|A) ui_dns_add "$name"; pause;;
+            n|N) ((page+1>=pages)) || page=$((page+1));;
+            p|P) ((page==0)) || page=$((page-1));;
+            *) if [[ $choice =~ ^[1-9][0-9]{0,5}$ ]] && ((choice>page*20 && choice<=count && choice<=(page+1)*20)); then ui_dns_record "$name" "$data" "$choice"; pause; fi;;
+        esac
+    done
+}
+ui_cloudflare() {
+    local choice token value state zones zone name data count i page=0 rows=()
+    while true; do
+        ui_clear
+        token=未设置
+        if [[ -s $STATE/cloudflare.token && ! -L $STATE/cloudflare.token ]]; then IFS= read -r value < "$STATE/cloudflare.token"; token="…${value: -4}"; fi
+        state=未运行; service_cmd systemctl is-active --quiet ngx-cf-update.timer >/dev/null 2>&1 && state=运行中
+        title "Cloudflare · Token $token · 每周 IP 同步 $state"
+        rows=()
+        if [[ $token == 未设置 ]]; then
+            hint '还没添加 Token'
+            hint 'Token 怎么创建：My Profile → API Tokens'
+            hint '选择 Edit zone DNS template'
+            hint '权限：Zone.DNS Edit + Zone.Zone Read'
+            echo '   t) 添加 Token   s) 同步 Cloudflare IP 段   0) 返回'
+        else
+            zones=$(cf_zones) || return 1
+            [[ -z $zones ]] || mapfile -t rows <<< "$zones"
+            ((page*9<${#rows[@]})) || page=0
+            echo '   域名'
+            for ((i=page*9;i<${#rows[@]} && i<(page+1)*9;i++)); do
+                IFS=$'\t' read -r zone name <<< "${rows[i]}"
+                data=$(cf_record_data "$zone") || return 1
+                count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' <<< "$data")
+                printf '   %s %s  %s 条解析\n' "$((i%9+1))" "$(pad "$name" 26)" "$count"
+            done
+            echo '   ───'
+            echo '   1-9) 管理域名解析   t) Token 管理 ▸   s) 同步 Cloudflare IP 段   0) 返回'
+            ((${#rows[@]}<=9)) || echo '   n) 下一页域名   p) 上一页域名'
+        fi
+        ask choice '请选择: ' || return 0
+        case $choice in
+            0) return 0;;
+            t|T) if [[ $token == 未设置 ]]; then cf_token set; else ui_cf_token; fi; pause;; s|S) ui_run cf update; pause;;
+            n|N) (( (page+1)*9>=${#rows[@]} )) || page=$((page+1));;
+            p|P) ((page==0)) || page=$((page-1));;
+            *) if [[ $choice =~ ^[1-9]$ ]] && ((page*9+choice<=${#rows[@]})); then
+                IFS=$'\t' read -r zone name <<< "${rows[page*9+choice-1]}"
+                ui_dns_zone "$zone" "$name" || pause
+            fi;;
+        esac
+    done
+}
 ui_doctor() {
+    ui_clear
     local findings line fix name
     title '一键体检'
     findings=$(ui_findings)
@@ -1224,6 +1363,7 @@ ui_doctor() {
     done <<< "$findings"
 }
 ui_backup() {
+    ui_clear
     local choice index selected files=() file
     title '备份恢复'
     echo '   1) 立即备份   2) 恢复   3) 打开备份目录说明   0) 返回'
@@ -1255,16 +1395,19 @@ menu() {
             c|C) ui_cloudflare; pause;;
             d|D) ui_doctor; pause;;
             b|B) ui_backup; pause;;
-            *) if [[ $choice =~ ^[1-9][0-9]*$ ]] && ((choice<=${#names[@]})); then ui_site "${names[choice-1]}"; fi;;
+            *) if [[ $choice =~ ^[1-9][0-9]*$ ]] && ((choice<=${#names[@]})); then ui_site "${names[choice-1]}" || pause; fi;;
         esac
     done
 }
 
 main() {
     local args=() arg cmd
-    for arg in "$@"; do
-        case $arg in --dns) DNS_REQUEST=1;; --open-firewall) OPEN=1;; --yes) YES=1;; --purge-cert) PURGE=1;; --with-keys) WITH_KEYS=1;; *) args+=("$arg");; esac
-    done
+    # DNS 内容可能恰好是 --dns / --yes，由 DNS 子命令自行解析选项。
+    if [[ ${1:-} == dns ]]; then args=("$@"); else
+        for arg in "$@"; do
+            case $arg in --dns) DNS_REQUEST=1;; --open-firewall) OPEN=1;; --yes) YES=1;; --purge-cert) PURGE=1;; --with-keys) WITH_KEYS=1;; *) args+=("$arg");; esac
+        done
+    fi
     set -- "${args[@]}"
     cmd=${1:-}; (($#)) && shift
     if [[ $cmd != adopt && $cmd != _dns-* && $cmd != help && $cmd != -h && $cmd != --help ]] && ! { if [[ -z $cmd || $UI_MODE == 1 ]]; then adopt_engine scan >/dev/null 2>&1; else adopt_engine scan; fi; }; then
@@ -1382,13 +1525,13 @@ cf_warnings() {
         cloud=$(cf_detect "$domain")
         case $cloud in
             橙云)
-                [[ ${CLOUDFLARE:-off} == on ]] || warn "$domain：橙云但 cloudflare 模式关闭，请 ngx set $NAME cloudflare on（接管站点需先 convert）"
+                [[ ${CLOUDFLARE:-off} == on ]] || warn "$domain：橙云但 Cloudflare 模式关闭，请 ngx set $NAME cloudflare on（接管站点需先 convert）"
                 case $PORT in 443|2053|2083|2087|2096|8443) ;; *) warn "$domain：橙云不代理 HTTPS 端口 $PORT；可用 443、2053、2083、2087、2096、8443";; esac
                 if [[ $TYPE == emby ]]; then
                     warn "$domain：Cloudflare 条款限制通过免费 CDN 传送大量视频；建议为播放节点建立灰云子域 play.$domain，类型 emby，上游 $UPSTREAM"
                 fi
                 hint "$domain：Cloudflare SSL 模式必须为 Full (strict)" ;;
-            灰云) [[ ${CLOUDFLARE:-off} != on ]] || hint "$domain：cloudflare 模式开启但当前灰云，无害；--cf-only 会拒绝直接访问" ;;
+            灰云) [[ ${CLOUDFLARE:-off} != on ]] || hint "$domain：Cloudflare 模式开启但当前灰云，无害；--cf-only 会拒绝直接访问" ;;
         esac
     done
     return 0
@@ -1801,7 +1944,7 @@ cf_records() {
         ((page++))
     done
 }
-dns_command() {
+dns_set_legacy() {
     local action=${1:-} name=${2:-} proxied='' domain zone records id kind record address flag payload public4 public6
     [[ $action == list || $action == set ]] && (($#>=2)) || return 1
     shift 2
@@ -1845,6 +1988,237 @@ PY
         ok "$domain DNS 已更新"
     done
     [[ $action != set ]] || rm -rf -- "$STATE/cache"
+}
+# 全量 DNS JSON：保留 TXT 空白和 SRV/CAA data，不经 TSV 往返。
+cf_record_data() {
+    local zone=$1 page=1 pages data result='[]'
+    while true; do
+        data=$(cf_api GET "/zones/$zone/dns_records?per_page=100&page=$page") || return 1
+        result=$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])+json.load(sys.stdin)["result"]))' "$result" <<< "$data") || return 1
+        pages=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("result_info",{}).get("total_pages",1))' <<< "$data")
+        [[ $pages =~ ^[0-9]+$ ]] || return 1
+        ((page<pages)) || break
+        ((page++))
+    done
+    printf '%s\n' "$result"
+}
+dns_scope() {
+    local name=$1 zones
+    zones=$(cf_zones) || return 1
+    python3 - "$name" "$zones" <<'PY'
+import re,sys
+name=sys.argv[1].lower().rstrip('.')
+if len(name)>253 or not re.fullmatch(r'(?:\*\.)?[a-z0-9_](?:[a-z0-9_.-]*[a-z0-9_])?',name) or '..' in name:
+ sys.exit('无效的 DNS 名称')
+matches=[]
+for row in sys.argv[2].splitlines():
+ zid,zone=row.split('\t'); zone=zone.lower()
+ if name==zone or name.endswith('.'+zone): matches.append((len(zone),zid,zone))
+if not matches: sys.exit('名称不在 Token 授权的域名内')
+_,zid,zone=max(matches)
+print(zid+'\t'+zone+'\t'+name)
+PY
+}
+dns_site() {
+    local site domains domain
+    while IFS= read -r site; do
+        domains=$(site_field "$site" DOMAINS)
+        for domain in ${domains//,/ }; do
+            [[ ${domain,,} != "$1" ]] || printf '%s\n' "$site"
+        done
+    done < <(site_names)
+}
+# 新建和编辑共用校验器；JSON 仅由 json.dumps 构建。
+dns_payload() {
+    python3 - "$@" <<'PY'
+import sys,json,re,ipaddress
+zone,name,kind,content,proxy,ttl,priority,old=sys.argv[1:]
+try:
+ kind=kind.upper(); name=name.lower().rstrip('.')
+ if kind not in ('A','AAAA','CNAME','TXT','MX','SRV','CAA','NS'): raise ValueError('类型仅支持 A/AAAA/CNAME/TXT/MX/SRV/CAA/NS')
+ if not (name==zone or name.endswith('.'+zone)): raise ValueError('名称必须在当前域名内')
+ labels=name.split('.')
+ if len(name)>253 or any(len(l)>63 or not re.fullmatch(r'[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?|\*',l) for l in labels) or '*' in labels[1:]: raise ValueError('无效的 DNS 名称')
+ row=json.loads(old) if old else {}
+ def integer(v,low,high,label):
+  if not re.fullmatch(r'[0-9]{1,6}',str(v)) or not low<=int(v)<=high: raise ValueError(label+' 无效')
+  return int(v)
+ def host(v):
+  v=v.lower().rstrip('.')
+  if len(v)>253 or not v or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',l) for l in v.split('.')): raise ValueError('无效的目标主机名')
+  try: ipaddress.ip_address(v)
+  except ValueError: return v
+  raise ValueError('目标必须是主机名')
+ payload=dict(type=kind,name=name)
+ if content or not old:
+  if not content or any(ord(c)<32 or ord(c)==127 for c in content): raise ValueError('内容不能为空或包含控制字符')
+  if kind in ('A','AAAA'):
+   ip=ipaddress.ip_address(content)
+   if ip.version != (4 if kind=='A' else 6): raise ValueError('IP 类型不匹配')
+   payload['content']=str(ip)
+  elif kind in ('CNAME','MX','NS'): payload['content']=host(content)
+  elif kind=='SRV':
+   if len(labels)<3 or not re.fullmatch(r'_[a-z0-9][a-z0-9-]*',labels[0]) or labels[1] not in ('_tcp','_udp','_tls'): raise ValueError('SRV 名称格式：_service._tcp/udp/tls.域名')
+   parts=content.split()
+   if len(parts)!=4: raise ValueError('SRV 内容格式：priority weight port target')
+   p,w,port,target=parts
+   payload['data']=dict(service=labels[0],proto=labels[1],name='.'.join(labels[2:]),priority=integer(p,0,65535,'priority'),weight=integer(w,0,65535,'weight'),port=integer(port,0,65535,'port'),target=host(target))
+  elif kind=='CAA':
+   parts=content.split(maxsplit=2)
+   if len(parts)!=3: raise ValueError('CAA 内容格式：flags tag value')
+   flags,tag,value=parts
+   if tag not in ('issue','issuewild','iodef'): raise ValueError('CAA tag 无效')
+   payload['data']=dict(flags=integer(flags,0,255,'flags'),tag=tag,value=value)
+  else:
+   if len(content.encode())>2048: raise ValueError('TXT 内容过长')
+   payload['content']=content
+ if priority:
+  if kind!='MX': raise ValueError('--priority 仅用于 MX')
+  payload['priority']=integer(priority,0,65535,'priority')
+ elif kind=='MX' and not old: raise ValueError('MX 必须指定 --priority')
+ if proxy:
+  if proxy not in ('on','off'): raise ValueError('--proxied 必须是 on 或 off')
+  if kind not in ('A','AAAA','CNAME') and proxy=='on': raise ValueError('该类型不支持橙云')
+  payload['proxied']=proxy=='on'
+ elif not old: payload['proxied']=False
+ if ttl or not old:
+  value=integer(ttl or '1',1,86400,'TTL')
+  if value!=1 and value<60: raise ValueError('TTL 必须为 1（自动）或 60–86400')
+  payload['ttl']=value
+ if old and len(payload)==2: raise ValueError('请指定需要修改的内容、代理或 TTL')
+ print(json.dumps(payload))
+except (ValueError,TypeError) as e: sys.exit('DNS 校验失败：'+str(e))
+PY
+}
+dns_table() {
+    local zone=$1 data=$2 start=${3:-0} limit=${4:-20} i col width record site
+    local cells=(序号 类型 名称 内容 代理 TTL) widths=(0 0 0 0 0 0) rows=()
+    # 每个单元格占一行；消除远端控制字符，防止破坏终端布局。
+    mapfile -t rows < <(python3 - "$zone" "$data" "$start" "$limit" <<'PY'
+import json,sys
+zone,data,start,limit=sys.argv[1:]; rows=json.loads(data)
+for i,r in enumerate(rows[int(start):int(start)+int(limit)],int(start)+1):
+ name=r['name']; short='@' if name==zone else name.removesuffix('.'+zone)
+ content=r.get('content','')
+ d=r.get('data',{})
+ if r['type']=='SRV' and d: content=' '.join(str(d.get(k,'')) for k in ('priority','weight','port','target'))
+ if r['type']=='CAA' and d: content=' '.join(str(d.get(k,'')) for k in ('flags','tag','value'))
+ if r['type']=='MX': content=str(r.get('priority',0))+' '+content
+ proxy=('橙云' if r.get('proxied') else '灰云') if r['type'] in ('A','AAAA','CNAME') else '—'
+ ttl=r.get('ttl',1)
+ for cell in (i,r['type'],short,content,proxy,'自动' if ttl==1 else str(ttl)):
+  print(''.join(c if ord(c)>=32 and ord(c)!=127 else ' ' for c in str(cell)))
+PY
+)
+    for ((i=0;i<${#rows[@]};i+=6)); do
+        record=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])[int(sys.argv[2])-1]["name"])' "$data" "${rows[i]}")
+        site=$(dns_site "$record")
+        [[ -z $site ]] || rows[i+2]+=" · 网站 ${site//$'\n'/、}"
+    done
+    cells+=("${rows[@]}")
+    for i in "${!cells[@]}"; do
+        col=$((i%6)); width=$(display_width "${cells[i]}")
+        ((width<=widths[col])) || widths[col]=$width
+    done
+    for ((i=0;i<${#cells[@]};i+=6)); do
+        printf '   '
+        for ((col=0;col<6;col++)); do
+            ((col==0)) || printf '  '
+            pad "${cells[i+col]}" "${widths[col]}"
+        done
+        printf '\n'
+    done
+}
+dns_manage() {
+    local action=$1 name=$2 kind=${3^^} content=${4:-} YES=0 proxy='' ttl='' priority='' id='' scope zone zone_name records matches count selected payload site current result
+    shift 4
+    while (($#)); do
+        if [[ $1 == --yes && $action == rm ]]; then YES=1; shift; continue; fi
+        [[ $# -ge 2 ]] || { err 'DNS 参数缺少值'; return 1; }
+        case $1 in --content) content=$2;; --proxied) proxy=$2;; --ttl) ttl=$2;; --priority) priority=$2;; --id) id=$2;; *) err "未知 DNS 参数：$1"; return 1;; esac
+        [[ -n $2 ]] || { err 'DNS 参数不能为空'; return 1; }
+        shift 2
+    done
+    [[ -z $id || $id =~ ^[a-zA-Z0-9_-]+$ ]] || { err '无效的记录 ID'; return 1; }
+    scope=$(dns_scope "$name") || return 1
+    IFS=$'\t' read -r zone zone_name name <<< "$scope"
+    if [[ $action == add ]]; then
+        [[ -z $id ]] || { err '添加解析不接受 --id'; return 1; }
+        payload=$(dns_payload "$zone_name" "$name" "$kind" "$content" "$proxy" "$ttl" "$priority" '') || return 1
+        result=$(cf_api POST "/zones/$zone/dns_records" "$payload") || return 1
+        result=$(python3 -c 'import json,sys; print(json.dumps([json.load(sys.stdin)["result"]]))' <<< "$result") || return 1
+        dns_table "$zone_name" "$result" 0 1
+    else
+        [[ $kind =~ ^(A|AAAA|CNAME|TXT|MX|SRV|CAA|NS)$ ]] || { err '无效的 DNS 类型'; return 1; }
+        records=$(cf_record_data "$zone") || return 1
+        matches=$(python3 -c 'import json,sys; print(json.dumps([r for r in json.loads(sys.argv[1]) if r["name"]==sys.argv[2] and r["type"]==sys.argv[3] and (not sys.argv[4] or r["id"]==sys.argv[4])]))' "$records" "$name" "$kind" "$id")
+        count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' <<< "$matches")
+        if ((count!=1)); then
+            if ((count==0)); then err '没有匹配的解析'; else
+                dns_table "$zone_name" "$matches" 0 "$count"
+                python3 -c 'import json,sys; [print(str(i+1)+") --id "+r["id"]) for i,r in enumerate(json.load(sys.stdin))]' <<< "$matches"
+                err '多个记录匹配，请指定 --id'
+            fi
+            return 1
+        fi
+        selected=$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[0]))' <<< "$matches")
+        id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<< "$selected")
+        [[ $id =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+        if [[ $action == edit ]]; then payload=$(dns_payload "$zone_name" "$name" "$kind" "$content" "$proxy" "$ttl" "$priority" "$selected") || return 1
+        elif [[ -n $content$proxy$ttl$priority ]]; then err '删除仅接受 --id / --yes'; return 1; fi
+        site=$(dns_site "$name")
+        dns_table "$zone_name" "$matches" 0 1
+        if [[ -n $site ]]; then
+            warn "该解析用于网站 ${site//$'\n'/、}；删除会使网站无法访问，修改可能影响网站访问"
+            if [[ $action == edit && -n $content$ttl$priority ]]; then confirm '确认修改网站使用的解析？' || return 1; fi
+            if [[ $action == edit && -n $proxy ]]; then
+                [[ $site != *$'\n'* ]] || { err '多个网站使用该域名，请分别在网站页切换云朵'; return 1; }
+                current=$(python3 -c 'import json,sys; print("on" if json.load(sys.stdin).get("proxied") else "off")' <<< "$selected")
+                if [[ $current != "$proxy" ]]; then
+                    confirm "通过网站 $site 的橙云/灰云切换，使 nginx 同步？" || return 1
+                    rm -rf -- "$STATE/cache"
+                    ui_cloud_toggle "$site" || return 1
+                    payload=$(python3 -c 'import json,sys; d=json.load(sys.stdin); d.pop("proxied",None); print(json.dumps(d))' <<< "$payload")
+                fi
+            fi
+        fi
+        if [[ $action == rm ]]; then
+            [[ ${YES:-0} == 1 ]] || confirm "删除 $kind $name？" || return 1
+            cf_api DELETE "/zones/$zone/dns_records/$id" >/dev/null || return 1
+        elif [[ $(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' <<< "$payload") -gt 2 ]]; then
+            cf_api PATCH "/zones/$zone/dns_records/$id" "$payload" >/dev/null || return 1
+        fi
+    fi
+    rm -rf -- "$STATE/cache"
+    ok "$name · $kind · $action 成功"
+}
+dns_list() {
+    local name=${1:-} scope zone zone_name data zones
+    if [[ -z $name ]]; then
+        zones=$(cf_zones) || return 1
+        while IFS=$'\t' read -r zone zone_name; do
+            [[ -n $zone ]] || continue
+            data=$(cf_record_data "$zone") || return 1
+            title "$zone_name"; dns_table "$zone_name" "$data" 0 1000000
+        done <<< "$zones"
+    else
+        if [[ -f $STATE/sites/$name.env ]] && name_valid "$name"; then name=$(site_field "$name" DOMAINS); name=${name%%,*}; fi
+        scope=$(dns_scope "$name") || return 1
+        IFS=$'\t' read -r zone zone_name name <<< "$scope"
+        data=$(cf_record_data "$zone") || return 1
+        title "$zone_name · $name"; dns_table "$zone_name" "$data" 0 1000000
+    fi
+}
+dns_command() {
+    local action=${1:-}
+    (($#)) && shift
+    case $action in
+        list) (($#<=1)) || return 1; dns_list "$@";;
+        set) dns_set_legacy set "$@";;
+        add) (($#>=3)) || { err '用法：ngx dns add <name> <type> <content>'; return 1; }; dns_manage add "$1" "$2" "$3" "${@:4}";;
+        edit|rm) (($#>=2)) || { err "用法：ngx dns $action <name> <type> [选项]"; return 1; }; dns_manage "$action" "$1" "$2" '' "${@:3}";;
+        *) err '用法：ngx dns list|set|add|edit|rm'; return 1;;
+    esac
 }
 # UI 缓存只存状态；CLI 的实时探测行为保持不变。
 ui_cloud_state() {
