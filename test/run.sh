@@ -238,6 +238,8 @@ contains "$TMP/output" '上游不可达'
 report 'logs / top / doctor'
 # shellcheck source=test/followup.sh
 source "$BASE/test/followup.sh"
+# shellcheck source=test/v3.sh
+source "$BASE/test/v3.sh"
 # 用真实 nginx 解析所有模板、TLS、IPv6、静态站点、proxy；绝不 reload 系统服务。
 cat > "$TMP/nginx.conf" <<CONF
 user root;

@@ -15,13 +15,26 @@ err()   { echo "  ${R}✘${N} $*" >&2; }
 die()   { err "$*"; exit 1; }
 hint()  { echo "  ${D}$*${N}"; }
 title() { echo; echo "${BD}${C}■ $*${N}"; }
+display_width() {
+    python3 -c 'import re,sys,unicodedata
+text=re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", sys.argv[1])
+print(sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ("W","F") else 1 for c in text))' "$1"
+}
 pad() {
-    local s=$1 w=$2 wide=${1//[[:ascii:]]/}
-    local len=$(( ${#s} + ${#wide} ))
+    local s=$1 w=$2 len
+    len=$(display_width "$s")
     printf '%s%*s' "$s" "$(( w > len ? w - len : 0 ))" ''
 }
 ask() { local answer; read -r -p "  $2" answer || return 1; printf -v "$1" '%s' "${answer:-${3:-}}"; }
-confirm() { local answer; read -r -p "  $1 [y/N] " answer || return 1; [[ $answer == y || $answer == Y ]]; }
+confirm() {
+    local answer
+    # ui_run 收集输出时，确认提示仍必须显示在用户的终端上。
+    if [[ ${UI_MODE:-0} == 1 && -t 0 ]]; then
+        printf '  %s [y/N] ' "$1" > /dev/tty
+        read -r answer || return 1
+    else read -r -p "  $1 [y/N] " answer || return 1; fi
+    [[ $answer == y || $answer == Y ]]
+}
 [[ $EUID -eq 0 ]] || die '需要 root 权限运行'
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 ROOT=${NGX_ROOT:-}
@@ -34,7 +47,8 @@ LE=$ROOT/etc/letsencrypt
 WEB=$ROOT/var/www/ngx-acme
 LOG=$ROOT/var/log/nginx
 BACK=$ROOT/var/backups/ngx
-TX='' OPEN=0 YES=0 EMAIL='' WITH_KEYS=0 PURGE=0
+TX='' OPEN=0 YES=0 EMAIL='' WITH_KEYS=0 PURGE=0 DNS_REQUEST=0
+CERT_METHOD=http UI_MODE=0
 # NGX_ROOT 下禁止调用真实的系统服务/防火墙命令；隔离测试必须提供 PATH 桩。
 service_cmd() {
     local tool=$1 path; shift
@@ -42,10 +56,16 @@ service_cmd() {
     if [[ -n $ROOT && ( $path == /usr/* || $path == /bin/* || $path == /sbin/* ) ]]; then
         err "NGX_ROOT 下拒绝调用系统 $tool；请通过 PATH 提供测试桩"; return 1
     fi
-    "$tool" "$@"
+    if [[ $UI_MODE == 1 && $tool == systemctl ]]; then "$tool" "$@" >/dev/null 2>&1
+    else "$tool" "$@"; fi
+}
+ngtest_raw() {
+    if [[ -n $ROOT ]]; then nginx -t -p "$ROOT/" -c "$ETC/nginx.conf"; else nginx -t; fi
 }
 ngtest() {
-    if [[ -n $ROOT ]]; then nginx -t -p "$ROOT/" -c "$ETC/nginx.conf"; else nginx -t; fi
+    if [[ $UI_MODE == 1 ]]; then
+        ngtest_raw >/dev/null 2>&1
+    else ngtest_raw; fi
 }
 apply() { ngtest && service_cmd systemctl reload nginx; }
 name_valid() { [[ $1 =~ ^[[:alnum:]][[:alnum:]_-]{0,63}$ && $1 != acme-80 ]]; }
@@ -91,10 +111,11 @@ load_site() {
     local file=$STATE/sites/$NAME.env key value
     [[ -f $file && ! -L $file ]] || { err "站点不存在：$NAME"; return 1; }
     TYPE='' DOMAINS='' PORT='' UPSTREAM='' DOCROOT='' TLS='' CREATED=''
+    CERT_METHOD=http
     CLOUDFLARE=off CF_ONLY=off CERT_NAME='' FILE='' LINKS='' LISTENS='' UPSTREAMS='' CERT_PATHS='' ACCESS_LOGS='' ERROR_LOGS='' ENABLED='' ORIGIN_FILE=''
     while IFS='=' read -r key value; do
         case $key in
-            TYPE|DOMAINS|PORT|UPSTREAM|DOCROOT|TLS|CREATED|CLOUDFLARE|CF_ONLY|CERT_NAME|FILE|LINKS|LISTENS|UPSTREAMS|CERT_PATHS|ACCESS_LOGS|ERROR_LOGS|ENABLED|ORIGIN_FILE) printf -v "$key" '%s' "$value" ;;
+            TYPE|DOMAINS|PORT|UPSTREAM|DOCROOT|TLS|CREATED|CLOUDFLARE|CF_ONLY|CERT_NAME|FILE|LINKS|LISTENS|UPSTREAMS|CERT_PATHS|ACCESS_LOGS|ERROR_LOGS|ENABLED|ORIGIN_FILE|CERT_METHOD) printf -v "$key" '%s' "$value" ;;
             *) err "元数据字段无效：$key"; return 1 ;;
         esac
     done < "$file"
@@ -109,12 +130,14 @@ validate_site() {
     upstream_valid "$UPSTREAM" && path_valid "$DOCROOT" && [[ $TLS == on || $TLS == off ]] &&
     [[ $CLOUDFLARE == on || $CLOUDFLARE == off ]] && [[ $CF_ONLY == on || $CF_ONLY == off ]] &&
     [[ $CF_ONLY == off || $CLOUDFLARE == on ]] &&
+    [[ $CERT_METHOD == http || $CERT_METHOD == dns ]] &&
     [[ -z $CERT_NAME || $CERT_NAME =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] &&
     [[ $CREATED =~ ^[0-9T:Z-]+$ ]] || { err '输入无效：检查名称、类型、域名、端口（80 保留）、上游或目录'; return 1; }
 }
 save_site() {
     printf 'TYPE=%s\nDOMAINS=%s\nPORT=%s\nUPSTREAM=%s\nDOCROOT=%s\nTLS=%s\nCREATED=%s\n' \
         "$TYPE" "$DOMAINS" "$PORT" "$UPSTREAM" "$DOCROOT" "$TLS" "$CREATED" > "$STATE/sites/$NAME.env" || return 1
+    printf 'CERT_METHOD=%s\n' "$CERT_METHOD" >> "$STATE/sites/$NAME.env"
     printf 'CLOUDFLARE=%s\nCF_ONLY=%s\nCERT_NAME=%s\nORIGIN_FILE=%s\n' "$CLOUDFLARE" "$CF_ONLY" "$CERT_NAME" "${ORIGIN_FILE:-}" >> "$STATE/sites/$NAME.env"
 }
 check_conflicts() {
@@ -361,7 +384,9 @@ offer_firewall() {
     else hint "需要外网访问时请执行：fw open $1 tcp nginx（也请检查云安全组）"; fi
 }
 certbot_cmd() {
-    service_cmd certbot --config-dir "$LE" --work-dir "$ROOT/var/lib/letsencrypt" --logs-dir "$ROOT/var/log/letsencrypt" "$@"
+    if [[ $UI_MODE == 1 && ${1:-} != plugins ]]; then
+        service_cmd certbot --config-dir "$LE" --work-dir "$ROOT/var/lib/letsencrypt" --logs-dir "$ROOT/var/log/letsencrypt" "$@" >/dev/null 2>&1 || { err '证书操作失败，请检查 certbot 日志'; return 1; }
+    else service_cmd certbot --config-dir "$LE" --work-dir "$ROOT/var/lib/letsencrypt" --logs-dir "$ROOT/var/log/letsencrypt" "$@"; fi
 }
 cert_preflight() {
     local ipv4 ipv6 domain ips addr found
@@ -387,14 +412,19 @@ cert_preflight() {
     hint 'HTTP-01 还需云安全组/NAT 放行公网 TCP/80；本机检查不能证明外网可达，最终以 ACME 验证为准。橙云首次签发失败时请临时切换 Cloudflare 灰云。'
 }
 issue() {
-    cert_preflight || return 1
+    if ((DNS_REQUEST)); then CERT_METHOD=dns; fi
+    if [[ $CERT_METHOD == http ]]; then cert_preflight || return 1; fi
+    local auth=(--webroot -w "$WEB")
+    if [[ $CERT_METHOD == dns ]]; then dns_auth_args || return 1; auth=("${DNS_AUTH[@]}"); fi
     local args=() domain email=$EMAIL
     if [[ -z $email && -f $STATE/config ]]; then email=$(sed -n 's/^EMAIL=//p' "$STATE/config"); fi
     if [[ -n $email ]]; then email_valid "$email" || { err '邮箱格式无效'; return 1; }; args+=(--email "$email");
     else warn '未设置邮箱，将使用 --register-unsafely-without-email，无法接收账户通知'; args+=(--register-unsafely-without-email); fi
     for domain in ${DOMAINS//,/ }; do args+=(-d "$domain"); done
-    certbot_cmd certonly --non-interactive --agree-tos --webroot -w "$WEB" --cert-name "$(cert_id)" \
-        --deploy-hook 'systemctl reload nginx' "${args[@]}" || return 1
+    certbot_cmd certonly --non-interactive --agree-tos --force-renewal "${auth[@]}" --cert-name "$(cert_id)" \
+        --deploy-hook 'systemctl reload nginx' "${args[@]}" || { dns_credentials_clear; return 1; }
+    if [[ $CERT_METHOD == dns ]]; then dns_renewal_config || { dns_credentials_clear; return 1; }; fi
+    dns_credentials_clear
     [[ -s $LE/live/$(cert_id)/fullchain.pem && -s $LE/live/$(cert_id)/privkey.pem ]] || { err 'certbot 未生成证书'; return 1; }
     [[ -z $email ]] || printf 'EMAIL=%s\n' "$email" > "$STATE/config"
 }
@@ -410,6 +440,7 @@ emby_hint() {
 }
 add_site() {
     NAME=${1:-}; (($#)) && shift
+    CERT_METHOD=http; ((DNS_REQUEST==0)) || CERT_METHOD=dns
     CLOUDFLARE=off CF_ONLY=off CERT_NAME=''
     TYPE=emby DOMAINS='' PORT=10618 UPSTREAM=127.0.0.1:18618 DOCROOT=/var/www/html TLS=on CREATED=$(date -u +%FT%TZ)
     while (($#)); do
@@ -463,7 +494,9 @@ change_site() {
         set)
             check_conflicts || return 1
             if [[ $1 == domain && $TLS == on ]]; then
-                ((was_enabled)) || { err 'TLS 域名变更需先启用站点以完成 HTTP-01'; return 1; }
+                if [[ $CERT_METHOD == http ]]; then
+                    ((was_enabled)) || { err 'TLS 域名变更需先启用站点以完成 HTTP-01'; return 1; }
+                fi
                 # 保留旧 HTTPS 服务；签发期间通过 catch-all 提供新域名挑战。
                 issue || return 1
             fi
@@ -526,21 +559,63 @@ status() {
     title 'certbot 定时任务下次运行'
     service_cmd systemctl list-timers --all certbot.timer --no-pager
 }
+cert_deploy_hook() {
+    load_site "$1" || return 1
+    local config
+    config=$LE/renewal/$(cert_id).conf
+    [[ -f $config && ! -L $config ]] || { err '找不到现有证书的续期配置'; return 1; }
+    begin || return 1
+    python3 - "$config" <<'PY' || return 1
+import re,sys
+path=sys.argv[1]; lines=open(path).read().splitlines()
+header='[renewalparams]'; hook='systemctl reload nginx'
+if header not in lines: lines.append(header)
+start=lines.index(header)+1
+end=next((i for i in range(start,len(lines)) if lines[i].strip().startswith('[')),len(lines))
+for i in range(start,end):
+    match=re.match(r'\s*deploy_hook\s*=\s*(.*)',lines[i])
+    if match:
+        existing=match[1].strip().strip('"\'')
+        if not re.search(r'(^|[;&])\s*systemctl reload nginx\s*($|[;&])',existing):
+            lines[i]='deploy_hook = '+(existing+'; ' if existing else '')+hook
+        break
+else: lines.insert(start,'deploy_hook = '+hook)
+open(path,'w').write('\n'.join(lines)+'\n')
+PY
+    finish
+}
+
 cert_command() {
     local action=${1:-}; (($#)) && shift
     case $action in
         issue)
             load_site "${1:-}" || return 1; shift
-            if [[ ${1:-} == --email && $# == 2 ]]; then EMAIL=$2; shift 2; fi
+            while (($#)); do
+                case $1 in --dns) DNS_REQUEST=1; shift;; --email) (($#>=2)) || return 1; EMAIL=$2; shift 2;; *) return 1;; esac
+            done
             [[ $# == 0 ]] || { err '证书签发参数无效'; return 1; }
-            site_enabled || { err '请先启用站点'; return 1; }
+            if [[ $CERT_METHOD == http && $DNS_REQUEST == 0 ]]; then
+                site_enabled || { err '请先启用站点'; return 1; }
+            fi
             if [[ $TYPE == adopted ]]; then adopted_issue; return; fi
             begin && issue || return 1
             TLS=on
             save_site && generate && finish ;;
+        hook)
+            [[ $# == 1 ]] && cert_deploy_hook "$1" ;;
+        off)
+            load_site "${1:-}" && [[ $# == 1 && $TYPE != adopted ]] || return 1
+            begin || return 1
+            TLS=off; save_site && generate && finish ;;
         renew)
-            [[ $# == 0 || $# == 1 && $1 == --dry-run ]] || return 1
-            begin && ngtest && certbot_cmd renew "$@" --deploy-hook 'systemctl reload nginx' && finish ;;
+            local renew_args=() renew_name=''
+            while (($#)); do
+                case $1 in --dry-run) renew_args+=(--dry-run);;
+                    *) [[ -z $renew_name ]] || return 1; renew_name=$1;; esac
+                shift
+            done
+            if [[ -n $renew_name ]]; then load_site "$renew_name" || return 1; renew_args+=(--cert-name "$(cert_id)"); fi
+            begin && ngtest && certbot_cmd renew "${renew_args[@]}" --deploy-hook 'systemctl reload nginx' && finish ;;
         list)
             local file days expiry
             for file in "$STATE"/sites/*.env; do
@@ -571,6 +646,8 @@ backup() {
 import os,sys,tarfile
 root,dest,keys=sys.argv[1:]; keys=keys=='1'
 def select(info):
+    if not keys and (info.name=='etc/ngx/cloudflare.token' or info.name.startswith('etc/ngx/.token.') or info.name.endswith('.credentials')): return None
+    if info.name.startswith('etc/ngx/cache'): return None
     if not keys and info.isfile():
         with open(os.path.join(root,info.name),'rb') as f:
             if b'PRIVATE KEY-----' in f.read(): return None
@@ -656,6 +733,10 @@ PY
             esac
         done < "$metadata"
     done
+    # 普通备份不含 Token；恢复时保留当前 Token。
+    if [[ -f $STATE/cloudflare.token && ! -e $stage/etc/ngx/cloudflare.token ]]; then
+        cp -p "$STATE/cloudflare.token" "$stage/etc/ngx/cloudflare.token" || return 1
+    fi
     rm -rf -- "$STATE" || return 1
     cp -a "$stage/etc/ngx" "$STATE" || return 1
     for f in sites-available sites-enabled snippets conf.d; do
@@ -725,6 +806,7 @@ PY
 doctor() {
     local problems=0 file days
     title 'nginx 诊断'
+    service_cmd systemctl is-active --quiet nginx >/dev/null 2>&1 || { warn 'nginx 未运行'; problems=1; }
     ngtest || { err '配置校验失败'; problems=1; }
     if [[ -e $ETC/sites-enabled/default || -L $ETC/sites-enabled/default ]]; then warn 'Debian default 仍启用，请运行 ngx install'; problems=1; fi
     [[ $(firewall_state 80) == 已开放 ]] || { warn '无法确认 TCP/80 放行，请检查 fw status 和云安全组'; problems=1; }
@@ -764,6 +846,7 @@ for (endpoint,name),count in seen.items():
         load_site "$(basename "$file" .env)" || { problems=1; continue; }
         cf_display
         cf_warnings
+        if [[ $CLOUDFLARE == on && ! -s $ETC/conf.d/ngx-cloudflare-realip.conf ]]; then warn "$NAME 缺少 Cloudflare realip 配置"; problems=1; fi
         if [[ $TYPE == adopted ]]; then
             local upstream original_upstream=$UPSTREAM certificate
             for upstream in ${UPSTREAMS//,/ }; do
@@ -781,8 +864,8 @@ for (endpoint,name),count in seen.items():
         if [[ $TLS == on ]]; then
             days=$(cert_days)
             if [[ $days == '?' ]] || ((days<14)); then warn "$NAME 证书剩余 $days 天"; problems=1; fi
-            if ! grep -Eq '^deploy_hook *= *systemctl reload nginx$' "$LE/renewal/$(cert_id).conf" 2>/dev/null; then
-                warn "$NAME 缺少续期 deploy hook，请 ngx cert issue $NAME"; problems=1
+            if ! grep -Eq '^[[:space:]]*deploy_hook *= *([^#]*[;&][[:space:]]*)?systemctl reload nginx([[:space:]]*([;&]|$))' "$LE/renewal/$(cert_id).conf" 2>/dev/null; then
+                warn "$NAME 缺少续期 deploy hook，请 ngx cert hook $NAME"; problems=1
             fi
         fi
     done
@@ -834,7 +917,7 @@ ngx —— nginx 管理
   ngx set <名称> upstream|port|domain|cloudflare <值>
   ngx rm <名称> [--yes] [--purge-cert]
   ngx cert issue <名称> [--email you@x] [--open-firewall]
-  ngx cert renew [--dry-run]      续期（支持模拟）
+  ngx cert renew [名称] [--dry-run]      续期（支持模拟）
   ngx cert list                  列出证书
   ngx cert rm <名称> [--yes]      删除未被站点引用的证书
   ngx test|reload|restart
@@ -842,6 +925,11 @@ ngx —— nginx 管理
   ngx top [名称] [--since 1h]     默认最近 1000 条；支持 m/h/d
   ngx backup [--with-keys]        默认不备份私钥
   ngx restore <文件>             恢复受管配置，测试通过才加载
+  ngx cf token set|test|rm|zones  管理 Cloudflare Token（set 隐藏输入）
+  ngx dns list|set <名称> [--proxied on|off]
+  ngx cert issue <名称> --dns     DNS-01，无需放行 80
+  ngx cert hook <名称>            补上现有证书的续期加载 hook
+  ngx cert off <名称>             关闭 HTTPS，保留证书
   ngx cf update                  下载并应用 Cloudflare IP 范围
   ngx adopt [--dry-run]           扫描接管原站点（每次运行也会扫描）
   ngx convert <名称> --type emby|proxy|static [add 同类选项] [--yes]
@@ -855,243 +943,331 @@ ngx —— nginx 管理
 --yes 用于删除确认；备份和恢复需要可信归档；详见 README.md。
 EOT
 }
-# ---------- 交互菜单（数字选择） ----------
-pause() { local _; read -r -s -p "  ${D}按回车返回…${N}" _ || true; echo; }
-confirm_y() { local a; read -r -p "  $1 [Y/n] " a || return 1; [[ -z $a || $a == y || $a == Y ]]; }
-site_names() { local f; for f in "$STATE"/sites/*.env; do [[ -e $f ]] || continue; f=${f##*/}; printf '%s\n' "${f%.env}"; done; }
+# ---------- 按意图管理网站 ----------
+pause() { local answer; read -r -s -p '  按回车返回…' answer || true; echo; }
+confirm_y() { local answer; read -r -p "  $1 [Y/n] " answer || return 1; [[ -z $answer || $answer == y || $answer == Y ]]; }
+site_names() { local f; for f in "$STATE"/sites/*.env; do f=${f##*/}; printf '%s\n' "${f%.env}"; done; }
 site_field() { sed -n "s/^$2=//p" "$STATE/sites/$1.env" 2>/dev/null | head -1; }
-type_label() { case $1 in emby) echo 'EmbyHub';; proxy) echo '反向代理';; static) echo '静态网站';; adopted) echo '接管';; *) echo "$1";; esac; }
-
-# pick_site 变量名 [提示]：列出站点，按编号选择
-pick_site() {
-    local -a names; local i n mark c
+ui_words() { sed 's/站点/网站/g; s/上游/后端地址/g; s/upstream/后端地址/g; s/接管/手写配置/g'; }
+# 每项修改独立进程：失败会触发原有事务回滚。
+ui_run() {
+    local output result
+    output=$(UI_MODE=1; main "$@" 2>&1); result=$?
+    printf '%s\n' "$output" | ui_words | sed -n '/^  [✔!✘]/p; /^  .*需要/p; /^  .*请/p'
+    if ((result)); then err '操作失败，修改已尝试回滚；请按 d 体检'; else ok '完成'; fi
+    return "$result"
+}
+ui_status_label() {
+    if ! site_enabled; then printf '%s○ 已停用%s' "$D" "$N"
+    elif [[ $(reachable) == ✗ ]]; then printf '%s● 后端不通%s' "$Y" "$N"
+    else printf '%s● 在线%s' "$G" "$N"; fi
+}
+ui_cert_label() {
+    local days
+    if [[ $TLS != on ]]; then echo '未启用 HTTPS'; return; fi
+    days=$(cert_days)
+    if [[ $days == '?' ]]; then printf '%s证书缺失%s\n' "$R" "$N"
+    elif ((days<14)); then printf '%s剩 %s 天%s\n' "$R" "$days" "$N"
+    else printf '剩 %s 天\n' "$days"; fi
+}
+ui_findings() {
+    # 只提取 doctor 的诊断消息，丢弃 nginx/systemctl/ss 原始输出。
+    (UI_MODE=1; doctor) 2>&1 |
+        sed $'s/\033\\[[0-9;]*m//g' | sed -n 's/^  [!✘] //p' | ui_words
+}
+ui_dashboard() {
+    local names findings count health state i tag col width
+    local cells=(网站 状态 域名 证书 Cloudflare) widths=(0 0 0 0 0)
     mapfile -t names < <(site_names)
-    ((${#names[@]})) || { warn '还没有站点，先用「2) 添加站点」'; return 1; }
-    echo
+    findings=$(ui_findings)
+    count=0; [[ -z $findings ]] || count=$(printf '%s\n' "$findings" | wc -l)
+    health=一切正常; ((count==0)) || health="有 $count 个问题（按 d 查看）"
+    state=未运行; service_cmd systemctl is-active --quiet nginx >/dev/null 2>&1 && state=运行中
+    printf '\n  %sngx 网站管理%s    nginx %s · %s 个网站 · %s\n' "$BD" "$N" "$state" "${#names[@]}" "$health"
+    echo '  ─────────────────────────────────────────────────────────'
     for i in "${!names[@]}"; do
-        n=${names[i]}
-        if (load_site "$n" >/dev/null 2>&1 && site_enabled >/dev/null 2>&1); then mark="${G}●${N}"; else mark="${D}○${N}"; fi
-        printf '   %s%2d%s) %s %s %s %s\n' "$BD" $((i + 1)) "$N" "$mark" "$(pad "$n" 14)" "$(pad "$(site_field "$n" DOMAINS)" 28)" "${D}$(type_label "$(site_field "$n" TYPE)")${N}"
+        load_site "${names[i]}" >/dev/null 2>&1 || continue
+        tag=''; [[ $TYPE != adopted ]] || tag=' 手写配置'
+        cells+=("$((i+1)) $NAME$tag" "$(ui_status_label)" "$DOMAINS" "$(ui_cert_label)" "$(ui_cloud_state "${DOMAINS%%,*}")")
     done
-    hint '● 已启用  ○ 已停用'
-    ask c "${2:-选择站点编号}: " || return 1
-    if ! [[ $c =~ ^[0-9]+$ ]] || ((c < 1 || c > ${#names[@]})); then err '无效编号'; return 1; fi
-    printf -v "$1" '%s' "${names[c - 1]}"
+    # 表头和数据共用可见列宽；ANSI 不占宽度，中文占两列。
+    for i in "${!cells[@]}"; do
+        col=$((i % 5)); width=$(display_width "${cells[i]}")
+        ((width<=widths[col])) || widths[col]=$width
+    done
+    for ((i=0; i<${#cells[@]}; i+=5)); do
+        printf '   %s  %s  %s  %s  %s\n' \
+            "$(pad "${cells[i]}" "${widths[0]}")" "$(pad "${cells[i+1]}" "${widths[1]}")" \
+            "$(pad "${cells[i+2]}" "${widths[2]}")" "$(pad "${cells[i+3]}" "${widths[3]}")" \
+            "$(pad "${cells[i+4]}" "${widths[4]}")"
+    done
+    echo '  ─────────────────────────────────────────────────────────'
+    echo '   1-9) 管理网站   n) 新建网站   c) Cloudflare 设置'
+    echo '   d) 一键体检     b) 备份恢复   0) 退出'
+    ((${#names[@]}<=9)) || hint '也可输入大于 9 的网站编号'
 }
-
-ui_add() {
-    local t type name domain port upstream root email args=() def
-    title '添加站点'
-    echo "   1) EmbyHub 媒体服务   2) 反向代理（其他服务）   3) 静态网站"
-    ask t '站点类型 [1]: ' 1 || return 1
-    case $t in 1) type=emby;; 2) type=proxy;; 3) type=static;; *) err '无效选择'; return 1;; esac
-    ask domain '域名（多个用逗号分隔，如 emby.example.com）: ' || return 1
-    [[ -n $domain ]] || { err '域名不能为空'; return 1; }
-    name=${domain%%,*}; name=${name%%.*}
-    ask name "站点名称 [$name]: " "$name" || return 1
-    ask port '对外端口 [443]: ' 443 || return 1
-    if [[ $type == static ]]; then
-        ask root "网站目录 [/var/www/$name]: " "/var/www/$name" || return 1; args+=(--root "$root")
-    else
-        def=127.0.0.1:10618; [[ $type == emby ]] || def=127.0.0.1:8080
-        ask upstream "后端地址 [$def]: " "$def" || return 1; args+=(--upstream "$upstream")
-    fi
-    if confirm_y '启用 HTTPS 并自动申请 Let'"'"'s Encrypt 证书？（推荐）'; then
-        email=$(sed -n 's/^EMAIL=//p' "$STATE/config" 2>/dev/null)
-        ask email "证书通知邮箱${email:+ [$email]}（可留空）: " "$email" || return 1
-        [[ -z $email ]] || args+=(--email "$email")
-    else
-        args+=(--no-tls)
-    fi
-    if confirm '域名在 Cloudflare 开了橙云（代理）吗？'; then
-        args+=(--cloudflare)
-        confirm '只允许 Cloudflare 访问源站（隐藏真实 IP 时推荐）？' && args+=(--cf-only)
-    fi
-    echo; hint "将创建：$(type_label "$type") $domain → 端口 $port"
-    confirm_y '确认创建？' || return 1
-    main add "$name" --type "$type" --domain "$domain" --port "$port" "${args[@]}"
+ui_today() {
+    local file=$LOG/ngx-$NAME.access.log
+    [[ $TYPE != adopted ]] || file=${ACCESS_LOGS%%,*}
+    python3 - "$file" <<'PY'
+import sys,datetime,re
+count=0; today=datetime.datetime.now().strftime('%d/%b/%Y')
+try:
+ with open(sys.argv[1],errors='replace') as f:
+  count=sum(bool(re.search(r'\['+today+r':',line)) for line in f)
+except OSError: pass
+print(format(count,','))
+PY
 }
-
-ui_modify() {
-    local name c v state
-    pick_site name '要修改哪个站点' || return 1
-    [[ $(site_field "$name" TYPE) == adopted ]] && { warn '这是接管的站点：可「查看/编辑配置」，或在 Cloudflare 菜单里转换为标准模板'; }
-    state=$(site_field "$name" CLOUDFLARE)
-    title "修改站点 $name"
-    echo "   1) 修改域名（当前 $(site_field "$name" DOMAINS)）"
-    echo "   2) 修改端口（当前 $(site_field "$name" PORT)）"
-    echo "   3) 修改后端地址（当前 $(site_field "$name" UPSTREAM)）"
-    echo "   4) Cloudflare 模式（当前 ${state:-off}）"
-    echo "   5) 查看配置文件"
-    echo "   6) 手动编辑配置（保存后自动检查，出错回滚）"
-    echo "   0) 返回"
-    ask c '请选择: ' || return 0
-    case $c in
-        1) ask v '新域名（多个用逗号）: ' && main set "$name" domain "$v";;
-        2) ask v '新端口: ' && main set "$name" port "$v";;
-        3) ask v '新后端地址（如 127.0.0.1:10618）: ' && main set "$name" upstream "$v";;
-        4) if [[ $state == on ]]; then confirm '关闭 Cloudflare 模式？' && main set "$name" cloudflare off
-           else confirm '开启 Cloudflare 模式（识别真实访客 IP）？' && main set "$name" cloudflare on; fi;;
-        5) main show "$name";;
-        6) main edit "$name";;
+ui_site_render() {
+    load_site "$1" >/dev/null 2>&1 || return 1
+    title "$NAME · $DOMAINS                         $(ui_status_label)"
+    hint "后端地址 ${UPSTREAM:-$DOCROOT} · HTTPS $(ui_cert_label) · $(ui_cloud_state "${DOMAINS%%,*}") · 今日请求 $(ui_today)"
+    if [[ $TYPE == adopted ]]; then
+        hint '手写配置：修改域名、端口、后端地址和 HTTPS 请用 e'
+        echo '   5) 查看访问日志   6) 查看错误日志   7) 访问统计'
+        echo '   9) 启用/停用网站  e) 手动编辑配置  u) 升级为标准配置'
+        echo '   0) 返回'
+    else
+        echo '   1) 修改域名        5) 查看访问日志      9) 启用/停用网站'
+        echo '   2) 修改端口        6) 查看错误日志      x) 删除网站'
+        echo '   3) 修改后端地址    7) 访问统计          e) 手动编辑配置'
+        echo '   4) HTTPS 证书 ▸    8) 橙云/灰云切换     0) 返回'
+    fi
+}
+ui_site_action() {
+    local name=$1 choice=$2 value
+    load_site "$name" >/dev/null 2>&1 || return 1
+    if [[ $TYPE == adopted ]]; then
+        case $choice in 1|2|3|4|8|x) hint '请用 e 编辑手写配置，或用 u 升级'; return 0;; esac
+    fi
+    case $choice in
+        1) ask value '新域名: ' && ui_run set "$name" domain "$value";;
+        2) ask value '新端口: ' && ui_run set "$name" port "$value";;
+        3) ask value '新后端地址: ' && ui_run set "$name" upstream "$value";;
+        4) ui_cert "$name";;
+        5) main logs "$name" -n 50;;
+        6) main logs "$name" --error -n 50;;
+        7) main top "$name" --since 1d;;
+        8) ui_cloud_toggle "$name";;
+        9) if site_enabled; then confirm "停用 $name？" && ui_run disable "$name"; else ui_run enable "$name"; fi;;
+        x) confirm "删除网站 $name？证书保留" && ui_run rm "$name" --yes;;
+        e) (UI_MODE=1; main edit "$name") | ui_words;;
+        u) [[ $TYPE == adopted ]] || return 1
+           value=proxy; [[ -n $UPSTREAM ]] || value=static
+           (UI_MODE=1; main convert "$name" --type "$value") | ui_words;;
         *) return 0;;
     esac
 }
-
-ui_toggle() {
-    local name
-    pick_site name '启用/停用哪个站点' || return 1
-    if (load_site "$name" >/dev/null 2>&1 && site_enabled >/dev/null 2>&1); then
-        confirm "停用 $name？访问会立即中断" && main disable "$name"
-    else
-        confirm_y "启用 $name？" && main enable "$name"
-    fi
+ui_site() {
+    local name=$1 choice
+    while [[ -f $STATE/sites/$name.env ]]; do
+        ui_site_render "$name" || return 1
+        ask choice '请选择: ' || return 0
+        [[ $choice != 0 && -n $choice ]] || return 0
+        ui_site_action "$name" "$choice"
+        pause
+    done
 }
-
-ui_remove() {
-    local name extra=()
-    pick_site name '删除哪个站点' || return 1
-    confirm "确定删除站点 $name？（配置会先备份）" || return 0
-    confirm '同时删除它的证书？' && extra+=(--purge-cert)
-    main rm "$name" --yes "${extra[@]}"
-}
-
 ui_cert() {
-    local c name
-    title '证书管理'
-    echo "   1) 查看所有证书和剩余天数"
-    echo "   2) 为站点申请 / 重新申请证书"
-    echo "   3) 立即续期所有证书"
-    echo "   4) 模拟续期（只检查，不改动）"
-    echo "   5) 删除不再使用的证书"
-    echo "   0) 返回"
-    ask c '请选择: ' || return 0
-    case $c in
-        1) main cert list;;
-        2) pick_site name '为哪个站点申请' && main cert issue "$name";;
-        3) confirm_y '现在续期？' && main cert renew;;
-        4) main cert renew --dry-run;;
-        5) pick_site name '删除哪个站点的证书' && confirm '确定删除？' && main cert rm "$name" --yes;;
-        *) return 0;;
+    local name=$1 choice args=()
+    echo '   1) 重新签发/立即续期   2) 模拟续期   3) 开启 HTTPS   4) 关闭 HTTPS   0) 返回'
+    ask choice '请选择: ' || return 0
+    case $choice in
+        1|3) [[ ! -s $STATE/cloudflare.token ]] || args+=(--dns)
+             ui_run cert issue "$name" "${args[@]}";;
+        2) ui_run cert renew "$name" --dry-run;;
+        4) confirm '关闭 HTTPS？' && ui_run cert off "$name";;
     esac
 }
-
-ui_logs() {
-    local name c n=50 args=()
-    pick_site name '查看哪个站点的日志' || return 1
-    echo "   1) 访问日志   2) 错误日志   3) 实时跟踪访问日志（Ctrl+C 结束）"
-    ask c '请选择 [1]: ' 1 || return 0
-    case $c in
-        1) ask n '显示最近多少行 [50]: ' 50; args=(-n "$n");;
-        2) ask n '显示最近多少行 [50]: ' 50; args=(--error -n "$n");;
-        3) args=(-f);;
-        *) return 0;;
-    esac
-    main logs "$name" "${args[@]}"
+ui_cloud_toggle() {
+    local name=$1 mode=on domain zone rows id type record content proxied payload old=() changed=() entry
+    load_site "$name" || return 1
+    [[ $TYPE != adopted ]] || { hint '请先升级为标准配置'; return 1; }
+    [[ $(ui_cloud_state "${DOMAINS%%,*}") != 橙云 ]] || mode=off
+    [[ $mode != on || -s $STATE/cloudflare-ips.txt ]] || ui_run cf update || return 1
+    if [[ ! -s $STATE/cloudflare.token ]]; then
+        hint "请在 Cloudflare 控制台 → DNS 把云朵改为 $([[ $mode == on ]] && echo 橙云 || echo 灰云)"
+        confirm '只修改 nginx 的 Cloudflare 模式？' || return 0
+        ui_run set "$name" cloudflare "$mode"
+        return
+    fi
+    # 先收集所有记录，再修改。修改失败则尽力恢复已修改的 DNS。
+    for domain in ${DOMAINS//,/ }; do
+        zone=$(cf_zone "$domain") && rows=$(cf_records "$zone" "$domain") || return 1
+        local found=0
+        while IFS=$'\t' read -r id type record content proxied; do
+            case $type in A|AAAA|CNAME) ;; *) continue;; esac
+            found=1
+            old+=("$zone $id $proxied")
+        done <<< "$rows"
+        ((found)) || { err "$domain 没有可切换的 DNS 记录"; return 1; }
+    done
+    local failed=0 flag=false
+    [[ $mode != on ]] || flag=true
+    for entry in "${old[@]}"; do
+        read -r zone id proxied <<< "$entry"
+        payload="{\"proxied\":$flag}"
+        if cf_api PATCH "/zones/$zone/dns_records/$id" "$payload" >/dev/null; then changed+=("$entry"); else failed=1; break; fi
+    done
+    if ((failed==0)); then ui_run set "$name" cloudflare "$mode" || failed=1; fi
+    if ((failed)); then
+        for entry in "${changed[@]}"; do
+            read -r zone id proxied <<< "$entry"
+            flag=false; [[ $proxied != True ]] || flag=true
+            cf_api PATCH "/zones/$zone/dns_records/$id" "{\"proxied\":$flag}" >/dev/null || err 'DNS 恢复失败，请检查 Cloudflare 控制台'
+        done
+        return 1
+    fi
+    rm -rf -- "$STATE/cache"
+    ok "$name · $([[ $mode == on ]] && echo 橙云 || echo 灰云) · nginx Cloudflare $mode"
+    [[ $mode != on ]] || hint 'Cloudflare SSL 模式请选择 Full (strict)'
 }
-
-ui_top() {
-    local name c
-    pick_site name '统计哪个站点' || return 1
-    echo "   1) 最近 1000 条请求   2) 最近 1 小时   3) 最近 24 小时"
-    ask c '请选择 [1]: ' 1 || return 0
-    case $c in 2) main top "$name" --since 1h;; 3) main top "$name" --since 24h;; *) main top "$name";; esac
+ui_add() {
+    local choice type domain name port backend directory https=on dns=未修改 cloud=灰云 args=() zone
+    title '新建网站'
+    echo '   1) EmbyHub   2) 其他服务   3) 静态网页'
+    ask choice '类型 [1]: ' 1 || return 1
+    case $choice in 1) type=emby;; 2) type=proxy;; 3) type=static;; *) return 1;; esac
+    ask domain '域名: ' || return 1
+    domain=${domain,,}; host_valid "$domain" || { err '域名无效'; return 1; }
+    name=${domain%%.*}
+    name_valid "$name" || { err '域名第一段不能作为网站名称，请用 CLI 指定名称'; return 1; }
+    if [[ -e $STATE/sites/$name.env ]]; then
+        local index=2
+        while [[ -e $STATE/sites/$name-$index.env ]]; do ((index++)); done
+        name=$name-$index
+    fi
+    ask port '端口 [443]: ' 443 || return 1
+    if [[ $type == static ]]; then
+        ask directory "网页目录 [/var/www/$name]: " "/var/www/$name" || return 1
+        args+=(--root "$directory")
+    else
+        backend=127.0.0.1:10618; [[ $type == emby ]] || backend=127.0.0.1:8080
+        ask backend "后端地址 [$backend]: " "$backend" || return 1
+        args+=(--upstream "$backend")
+    fi
+    confirm_y '启用 HTTPS？' || { https=off; args+=(--no-tls); }
+    # DNS 创建必须在证书签发前；先登记无 TLS，再申请证书。
+    if [[ -s $STATE/cloudflare.token ]] && zone=$(cf_zone "$domain" 2>/dev/null); then
+        [[ $https != on ]] || args+=(--dns)
+        if confirm_y '把 DNS 指向本机公网 IP？'; then
+            confirm '使用橙云？默认灰云' && cloud=橙云
+            dns=已更新
+        fi
+    elif [[ $https == on ]]; then
+        hint '请把 DNS 指向本机，并放行 80 端口（含云安全组）'
+    fi
+    if [[ $dns == 已更新 ]]; then
+        ui_run add "$name" --type "$type" --domain "$domain" --port "$port" "${args[@]}" --no-tls || return 1
+        local mode=off
+        [[ $cloud != 橙云 ]] || mode=on
+        if ! ui_run dns set "$name" --proxied "$mode"; then hint '网站已创建，DNS 更新失败；请修正 Token 后重试'; return 1; fi
+        if [[ $cloud == 橙云 ]]; then ui_run cf update && ui_run set "$name" cloudflare on || return 1; fi
+        [[ $https != on ]] || ui_run cert issue "$name" --dns || return 1
+    else
+        ui_run add "$name" --type "$type" --domain "$domain" --port "$port" "${args[@]}" || return 1
+    fi
+    load_site "$name" || return 1
+    local scheme=http suffix=":$port"
+    [[ $TLS != on ]] || scheme=https
+    [[ $port != 443 || $scheme != https ]] || suffix=''
+    title '网站已创建'
+    hint "URL：$scheme://$domain$suffix"
+    hint "证书：$(ui_cert_label) · DNS：$dns · Cloudflare：$(ui_cloud_state "$domain")"
+    emby_hint
 }
-
 ui_cloudflare() {
-    local c name t
-    title 'Cloudflare 与站点接管'
-    echo "   1) 更新 Cloudflare IP 段（每周也会自动更新）"
-    echo "   2) 开/关站点的 Cloudflare 模式"
-    echo "   3) 扫描并接管服务器上已有的 nginx 站点"
-    echo "   4) 把接管的站点转换为 ngx 标准模板"
-    echo "   0) 返回"
-    ask c '请选择: ' || return 0
-    case $c in
-        1) main cf update;;
-        2) pick_site name && if [[ $(site_field "$name" CLOUDFLARE) == on ]]; then confirm "关闭 $name 的 Cloudflare 模式？" && main set "$name" cloudflare off; else confirm_y "开启 $name 的 Cloudflare 模式？" && main set "$name" cloudflare on; fi;;
-        3) main adopt --dry-run; confirm_y '按上面的结果接管？' && main adopt;;
-        4) pick_site name '转换哪个站点' || return 1
-           echo "   1) EmbyHub   2) 反向代理   3) 静态网站"; ask t '转换为 [2]: ' 2 || return 0
-           case $t in 1) t=emby;; 3) t=static;; *) t=proxy;; esac
-           main convert "$name" --type "$t";;
-        *) return 0;;
+    local choice token='未设置' value
+    if [[ -f $STATE/cloudflare.token ]]; then IFS= read -r value < "$STATE/cloudflare.token"; token="…${value: -4}"; fi
+    title "Cloudflare 设置 · Token $token"
+    value=未运行; service_cmd systemctl is-active --quiet ngx-cf-update.timer >/dev/null 2>&1 && value=运行中
+    hint "每周 IP 同步：$value"
+    echo '   1) 添加/更换 Token   2) 测试 Token   3) 删除 Token'
+    echo '   4) 查看可管理的域名  5) 同步 Cloudflare IP 段   0) 返回'
+    ask choice '请选择: ' || return 0
+    case $choice in
+        1) cf_token set;; 2) cf_token test;; 3) confirm '删除 Token？DNS 续期将暂停' && cf_token rm;;
+        4) cf_token zones;; 5) ui_run cf update;;
     esac
 }
-
-ui_backup() {
-    local c i f
-    local -a files
-    title '备份与恢复'
-    echo "   1) 立即备份（不含证书私钥）"
-    echo "   2) 立即备份（包含证书私钥，请妥善保管）"
-    echo "   3) 从备份恢复"
-    echo "   0) 返回"
-    ask c '请选择: ' || return 0
-    case $c in
-        1) main backup;;
-        2) main backup --with-keys;;
-        3) mapfile -t files < <(ls -1t "$BACK"/*.tar.gz 2>/dev/null)
-           ((${#files[@]})) || { warn '还没有备份'; return 1; }
-           for i in "${!files[@]}"; do printf '   %s%2d%s) %s\n' "$BD" $((i + 1)) "$N" "${files[i]##*/}"; done
-           ask f '选择备份编号: ' || return 0
-           if ! [[ $f =~ ^[0-9]+$ ]] || ((f < 1 || f > ${#files[@]})); then err '无效编号'; return 1; fi
-           confirm "用 ${files[f - 1]##*/} 恢复？（恢复前会先检查，失败不生效）" && main restore "${files[f - 1]}";;
-        *) return 0;;
-    esac
-}
-
-menu() {
-    trap 'echo; exit 130' INT
-    local c state count test_state
-    while true; do
-        clear 2>/dev/null || true
-        count=$(site_names | grep -c .)
-        if systemctl is-active --quiet nginx 2>/dev/null; then state="${G}● 运行中${N}"; else state="${R}● 未运行${N}"; fi
-        if nginx -t >/dev/null 2>&1; then test_state="${G}配置正常${N}"; else test_state="${R}配置有错误（选 9 诊断）${N}"; fi
-        echo
-        echo "  ${BD}${C}ngx 网站管理${N}   ${D}$(hostname)${N}"
-        echo "  nginx $state · 站点 ${BD}$count${N} 个 · $test_state"
-        echo "  ${D}──────────────────────────────────────${N}"
-        echo "   ${BD}1${N}) 查看状态          ${BD}6${N}) 证书管理 ▸"
-        echo "   ${BD}2${N}) 添加站点          ${BD}7${N}) 查看日志"
-        echo "   ${BD}3${N}) 修改站点 ▸        ${BD}8${N}) 访问统计"
-        echo "   ${BD}4${N}) 启用 / 停用站点   ${BD}9${N}) 诊断问题"
-        echo "   ${BD}5${N}) 删除站点          ${BD}c${N}) Cloudflare / 接管 ▸"
-        echo "   ${BD}b${N}) 备份 / 恢复 ▸     ${BD}r${N}) 重新加载 nginx"
-        echo "   ${BD}i${N}) 安装 / 修复环境   ${BD}h${N}) 命令行用法"
-        echo "   ${BD}0${N}) 退出"
-        echo
-        read -r -p "  请选择: " c || { echo; exit 0; }
-        case $c in
-            1) (main status);;
-            2) (ui_add);;
-            3) (ui_modify);;
-            4) (ui_toggle);;
-            5) (ui_remove);;
-            6) (ui_cert);;
-            7) (ui_logs);;
-            8) (ui_top);;
-            9) (main doctor);;
-            c|C) (ui_cloudflare);;
-            b|B) (ui_backup);;
-            r|R) (main reload);;
-            i|I) (main install);;
-            h|H) (main help);;
-            0|q|Q|'') echo; exit 0;;
-            *) continue;;
+ui_doctor() {
+    local findings line fix name
+    title '一键体检'
+    findings=$(ui_findings)
+    [[ -n $findings ]] || { ok '一切正常'; return; }
+    while IFS= read -r line; do
+        fix='检查网站配置或运行环境'; name=${line%% *}
+        case $line in
+            *缺少续期*deploy*hook*) fix='补上续期加载 hook';;
+            *证书*|*续期*) fix='重新签发证书';;
+            *TCP/80*) fix='放行 80 端口，并检查云安全组';;
+            *Cloudflare*|*cloudflare*|*橙云*) fix='同步 IP 段，检查 DNS 和 Full (strict)';;
+            *后端地址*) fix='启动服务，检查后端地址和端口';;
+            *default*) fix='运行 ngx install 初始化配置';;
+            *未运行*) fix='检查 nginx 配置后重启';;
         esac
-        echo; pause
+        hint "$line → $fix"
+        case $line in
+            *缺少续期*deploy*hook*) [[ -f $STATE/sites/$name.env ]] || continue
+                confirm "是否修复 $name 的续期加载 hook？" && ui_run cert hook "$name";;
+            *证书剩余*) [[ -f $STATE/sites/$name.env ]] || continue
+                if confirm "现在修复 $name 的证书？"; then
+                    local args=(); [[ $(site_field "$name" CERT_METHOD) != dns ]] || args+=(--dns)
+                    ui_run cert issue "$name" "${args[@]}"
+                fi;;
+            *TCP/80*) if confirm '运行 fw 放行 80？'; then if service_cmd fw open 80 tcp nginx >/dev/null 2>&1; then ok '已放行 80'; else err '放行失败'; fi; fi;;
+            *realip*|*Cloudflare*范围*) confirm '同步 Cloudflare IP 段？' && ui_run cf update;;
+            *default*) confirm '初始化配置？' && ui_run install;;
+            *未运行*) confirm '重启 nginx？' && ui_run restart;;
+        esac
+    done <<< "$findings"
+}
+ui_backup() {
+    local choice index selected files=() file
+    title '备份恢复'
+    echo '   1) 立即备份   2) 恢复   3) 打开备份目录说明   0) 返回'
+    ask choice '请选择: ' || return 0
+    case $choice in
+        1) main backup; hint '默认不含私钥和 Token';;
+        2) mapfile -t files < <(printf '%s\n' "$BACK"/*.tar.gz | sort -r)
+           [[ -n ${files[0]:-} ]] || { hint '还没有备份'; return; }
+           for index in "${!files[@]}"; do
+               file=${files[index]}
+               printf '   %s) %s · %s 字节\n' "$((index+1))" "$(date -r "$file" '+%F %T')" "$(stat -c %s "$file")"
+           done
+           ask selected '备份编号: ' || return 0
+           [[ $selected =~ ^[1-9][0-9]*$ ]] && ((selected<=${#files[@]})) || return 1
+           confirm '恢复此备份？' && ui_run restore "${files[selected-1]}";;
+        3) hint "备份目录：$BACK"; hint '用 ls 查看；默认不含私钥和 Token，恢复需要现有证书';;
+    esac
+}
+menu() {
+    local choice names=()
+    UI_MODE=1
+    while true; do
+        ui_dashboard
+        mapfile -t names < <(site_names)
+        ask choice '请选择: ' || return 0
+        case $choice in
+            0|q|Q|'') return 0;;
+            n|N) ui_add; pause;;
+            c|C) ui_cloudflare; pause;;
+            d|D) ui_doctor; pause;;
+            b|B) ui_backup; pause;;
+            *) if [[ $choice =~ ^[1-9][0-9]*$ ]] && ((choice<=${#names[@]})); then ui_site "${names[choice-1]}"; fi;;
+        esac
     done
 }
+
 main() {
     local args=() arg cmd
     for arg in "$@"; do
-        case $arg in --open-firewall) OPEN=1;; --yes) YES=1;; --purge-cert) PURGE=1;; --with-keys) WITH_KEYS=1;; *) args+=("$arg");; esac
+        case $arg in --dns) DNS_REQUEST=1;; --open-firewall) OPEN=1;; --yes) YES=1;; --purge-cert) PURGE=1;; --with-keys) WITH_KEYS=1;; *) args+=("$arg");; esac
     done
     set -- "${args[@]}"
     cmd=${1:-}; (($#)) && shift
-    if [[ $cmd != adopt ]] && ! adopt_engine scan; then
+    if [[ $cmd != adopt && $cmd != _dns-* && $cmd != help && $cmd != -h && $cmd != --help ]] && ! { if [[ -z $cmd || $UI_MODE == 1 ]]; then adopt_engine scan >/dev/null 2>&1; else adopt_engine scan; fi; }; then
         case $cmd in help|-h|--help) warn '当前环境无法自动登记站点，仍显示帮助；可在可写环境执行 ngx adopt';; *) return 1;; esac
     fi
     case $cmd in status|doctor|add|set|convert|cert)
@@ -1103,7 +1279,9 @@ main() {
         '') menu;; help|-h|--help) help_text;; status) status;; install) install_ngx;;
         add) add_site "$@";; edit|rm|enable|disable|set) change_site "$cmd" "$@";;
         show) load_site "${1:-}" && nl -ba "$(site_file)";;
-        cf) [[ ${1:-} == update && $# == 1 ]] && cf_update;;
+        cf) case ${1:-} in update) [[ $# == 1 ]] && cf_update;; token) shift; cf_token "$@";; *) return 1;; esac;;
+        dns) dns_command "$@";;
+        _dns-auth|_dns-cleanup) dns_hook "$cmd";;
         adopt) [[ $# == 0 || $# == 1 && $1 == --dry-run ]] && adopt_engine scan "${1:-}";;
         convert) convert_site "$@";;
         cert) cert_command "$@";; test) ngtest;;
@@ -1421,7 +1599,7 @@ cert_path() {
 }
 adopted_save() {
     local key
-    for key in TYPE FILE LINKS DOMAINS PORT LISTENS UPSTREAM UPSTREAMS DOCROOT TLS CERT_PATHS CERT_NAME ACCESS_LOGS ERROR_LOGS ENABLED CREATED; do
+    for key in TYPE FILE LINKS DOMAINS PORT LISTENS UPSTREAM UPSTREAMS DOCROOT TLS CERT_PATHS CERT_NAME ACCESS_LOGS ERROR_LOGS ENABLED CREATED CERT_METHOD; do
         printf '%s=%s\n' "$key" "${!key}"
     done > "$STATE/sites/$NAME.env"
 }
@@ -1473,8 +1651,10 @@ adopted_issue() {
     [[ -n $CERT_NAME && $CERT_PATHS != *,* ]] || { err '无法关联唯一 certbot lineage；请先 ngx convert 并指定域名'; return 1; }
     domains_valid "$DOMAINS" || { err '接管域名含通配符或正则，HTTP-01 需要明确域名；请先转换'; return 1; }
     # 不向原配置注入 location；它必须已经把 HTTP-01 请求交给 ngx-acme webroot。
-    hint "接管站点使用原证书 lineage $CERT_NAME 重新签发；请确保原站点 HTTP/TLS 均服务 $WEB/.well-known/acme-challenge/"
-    begin && issue && finish
+    if [[ $CERT_METHOD != dns && $DNS_REQUEST == 0 ]]; then
+        hint "接管站点使用原证书 lineage $CERT_NAME 重新签发；请确保原站点 HTTP/TLS 均服务 $WEB/.well-known/acme-challenge/"
+    fi
+    begin && issue && adopted_save && finish
 }
 convert_site() {
     load_site "${1:-}" || return 1; shift
@@ -1527,6 +1707,226 @@ convert_site() {
         generate off && apply && issue && generate on || return 1
     fi
     finish && cf_warnings && emby_hint
+}
+
+# API 响应仅解析，不打印服务器错误正文（可能包含敏感信息）。
+cf_api() {
+    local method=$1 endpoint=$2 payload=${3:-} token=${CF_TOKEN:-} response
+    if [[ -z $token && -f $STATE/cloudflare.token && ! -L $STATE/cloudflare.token ]]; then
+        IFS= read -r token < "$STATE/cloudflare.token"
+    fi
+    [[ $token =~ ^[a-zA-Z0-9_-]{8,256}$ ]] || { err '请先添加 Cloudflare Token'; return 1; }
+    response=$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+        curl --config - --proto '=https' -fsS --max-time 20 -X "$method" \
+        -H 'Content-Type: application/json' ${payload:+--data-binary "$payload"} \
+        "https://api.cloudflare.com/client/v4$endpoint" 2>/dev/null) || { err 'Cloudflare 请求失败；检查网络和 Token 权限'; return 1; }
+    python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin)
+ if d.get("success") is not True: raise ValueError()
+ print(json.dumps(d))
+except (ValueError,TypeError): sys.exit(1)' <<< "$response" || { err 'Token 无效或权限不足：需要 Zone.DNS Edit + Zone.Zone Read'; return 1; }
+}
+cf_rows() {
+    python3 -c 'import json,sys
+for r in json.load(sys.stdin)["result"]:
+ print("\t".join(str(r.get(k,"")) for k in sys.argv[1:]))' "$@"
+}
+cf_zones() {
+    local page=1 data pages
+    while true; do
+        data=$(cf_api GET "/zones?per_page=50&page=$page") || return 1
+        cf_rows id name <<< "$data"
+        pages=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("result_info",{}).get("total_pages",1))' <<< "$data")
+        [[ $pages =~ ^[0-9]+$ ]] || return 1
+        ((page<pages)) || break
+        ((page++))
+    done
+}
+cf_zone() {
+    local rows
+    rows=$(cf_zones) || return 1
+    python3 - "$1" "$rows" <<'PY'
+import sys
+name=sys.argv[1].lower(); matches=[]
+for row in sys.argv[2].splitlines():
+ zone_id,zone=row.split('\t'); zone=zone.lower()
+ if name==zone or name.endswith('.'+zone): matches.append((len(zone),zone_id))
+if not matches: sys.exit(1)
+print(max(matches)[1])
+PY
+}
+cf_token_check() {
+    local data zones id zone
+    data=$(cf_api GET /user/tokens/verify) || return 1
+    python3 -c 'import json,sys; sys.exit(json.load(sys.stdin)["result"].get("status")!="active")' <<< "$data" || { err 'Token 未启用'; return 1; }
+    zones=$(cf_zones) || return 1
+    [[ -n $zones ]] || { err 'Token 没有可管理的域名'; return 1; }
+    while IFS=$'\t' read -r id zone; do
+        cf_api GET "/zones/$id/dns_records?per_page=1" >/dev/null || return 1
+    done <<< "$zones"
+    hint '需要 Zone.DNS Edit + Zone.Zone Read，仅授权所需域名；不要使用 Global API Key'
+    hint 'DNS 读取正常；编辑权限在写入时验证'
+    printf '%s\n' "$zones" | cut -f2
+}
+cf_token() {
+    [[ $# == 1 ]] || { err '用法：ngx cf token set|test|rm|zones'; return 1; }
+    local token tmp
+    case $1 in
+        set)
+            read -r -s -p '  Cloudflare Token: ' token || return 1
+            echo
+            CF_TOKEN=$token cf_token_check || return 1
+            mkdir -p "$STATE" || return 1
+            tmp=$(mktemp "$STATE/.token.XXXXXXXX") || return 1
+            chmod 600 "$tmp"; chown 0:0 "$tmp"
+            printf '%s\n' "$token" > "$tmp"
+            mv -f -- "$tmp" "$STATE/cloudflare.token" || return 1
+            rm -rf -- "$STATE/cache"
+            ok "Token 已保存 · …${token: -4}" ;;
+        test) cf_token_check && ok 'Token 检查通过';;
+        rm) rm -f -- "$STATE/cloudflare.token"; rm -rf -- "$STATE/cache"; ok 'Token 已删除';;
+        zones) cf_zones | cut -f2;;
+        *) return 1;;
+    esac
+}
+cf_records() {
+    local zone=$1 domain=$2 page=1 data pages
+    while true; do
+        data=$(cf_api GET "/zones/$zone/dns_records?name=$domain&per_page=100&page=$page") || return 1
+        cf_rows id type name content proxied <<< "$data"
+        pages=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("result_info",{}).get("total_pages",1))' <<< "$data")
+        [[ $pages =~ ^[0-9]+$ ]] || return 1
+        ((page<pages)) || break
+        ((page++))
+    done
+}
+dns_command() {
+    local action=${1:-} name=${2:-} proxied='' domain zone records id kind record address flag payload public4 public6
+    [[ $action == list || $action == set ]] && (($#>=2)) || return 1
+    shift 2
+    if (($#)); then [[ $# == 2 && $1 == --proxied && ( $2 == on || $2 == off ) ]] || return 1; proxied=$2; fi
+    load_site "$name" || return 1
+    public4=''; public6=''
+    if [[ $action == set ]]; then
+        public4=$(curl -4 -fsS --max-time 8 https://api.ipify.org) || :
+        public6=$(curl -6 -fsS --max-time 8 https://api6.ipify.org) || :
+        python3 - "$public4" "$public6" <<'PY' || { err '无法获取公网 IP'; return 1; }
+import sys,ipaddress
+ips=[ipaddress.ip_address(v) for v in sys.argv[1:] if v]
+if not ips: sys.exit(1)
+if sys.argv[1] and ipaddress.ip_address(sys.argv[1]).version!=4: sys.exit(1)
+if sys.argv[2] and ipaddress.ip_address(sys.argv[2]).version!=6: sys.exit(1)
+PY
+    fi
+    for domain in ${DOMAINS//,/ }; do
+        host_valid "$domain" || return 1
+        zone=$(cf_zone "$domain") || { err "$domain 不在 Token 授权范围"; return 1; }
+        records=$(cf_records "$zone" "$domain") || return 1
+        if [[ $action == list ]]; then printf '%s\n' "$records"; continue; fi
+        if awk -F '\t' '$2=="CNAME" {found=1} END {exit !found}' <<< "$records"; then err "$domain 已有 CNAME，请先在 Cloudflare 控制台处理"; return 1; fi
+        for kind in A AAAA; do
+            address=$public4; [[ $kind != AAAA ]] || address=$public6
+            [[ -n $address ]] || continue
+            record=$(awk -F '\t' -v t="$kind" '$2==t' <<< "$records")
+            if [[ $(wc -l <<< "$record") -gt 1 ]]; then err "$domain 有多个 $kind 记录，请先在控制台处理"; return 1; fi
+            id=${record%%$'\t'*}; flag=false
+            [[ $proxied != on ]] || flag=true
+            if [[ -z $proxied && $record == *$'\t'True ]]; then flag=true; fi
+            payload=$(python3 - "$kind" "$domain" "$address" "$flag" <<'PY'
+import json,sys
+kind,name,address,flag=sys.argv[1:]
+print(json.dumps(dict(type=kind,name=name,content=address,ttl=1,proxied=flag=='true')))
+PY
+)
+            if [[ -n $id ]]; then cf_api PUT "/zones/$zone/dns_records/$id" "$payload" >/dev/null || return 1
+            else cf_api POST "/zones/$zone/dns_records" "$payload" >/dev/null || return 1; fi
+        done
+        ok "$domain DNS 已更新"
+    done
+    [[ $action != set ]] || rm -rf -- "$STATE/cache"
+}
+# UI 缓存只存状态；CLI 的实时探测行为保持不变。
+ui_cloud_state() {
+    local domain=$1 cache=$STATE/cache/$1 now value zone rows
+    host_valid "$domain" || { echo '—'; return; }
+    now=$(date +%s)
+    if [[ -f $cache && ! -L $cache ]] && ((now-$(stat -c %Y "$cache")<60)); then cat "$cache"; return; fi
+    value='—'
+    if [[ -s $STATE/cloudflare.token ]]; then
+        if zone=$(cf_zone "$domain" 2>/dev/null) && rows=$(cf_records "$zone" "$domain" 2>/dev/null); then
+            if awk -F '\t' '$2=="A" || $2=="AAAA" || $2=="CNAME" {n++; if($5=="True") p++} END {exit !(n && n==p)}' <<< "$rows"; then value=橙云
+            elif awk -F '\t' '$2=="A" || $2=="AAAA" || $2=="CNAME" {found=1} END {exit !found}' <<< "$rows"; then value=灰云; fi
+        fi
+    else
+        CF_PUBLIC4=$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null) || :
+        CF_PUBLIC6=$(curl -6 -fsS --max-time 8 https://api6.ipify.org 2>/dev/null) || :
+        value=$(cf_detect "$domain"); [[ $value != 其他 ]] || value='—'
+    fi
+    mkdir -p "$STATE/cache"
+    printf '%s\n' "$value" > "$cache"
+    printf '%s\n' "$value"
+}
+dns_credentials_clear() { [[ -z ${DNS_CREDENTIALS:-} ]] || rm -f -- "$DNS_CREDENTIALS"; DNS_CREDENTIALS=''; }
+dns_hooks() {
+    [[ $SELF =~ ^/[a-zA-Z0-9_./-]+$ ]] || { err 'DNS hook 的程序路径不能含特殊字符'; return 1; }
+    DNS_AUTH_HOOK="NGX_ROOT=$ROOT $SELF _dns-auth"
+    DNS_CLEANUP_HOOK="NGX_ROOT=$ROOT $SELF _dns-cleanup"
+}
+dns_auth_args() {
+    [[ -s $STATE/cloudflare.token ]] || { err 'DNS-01 需要 Cloudflare Token'; return 1; }
+    local domain token
+    for domain in ${DOMAINS//,/ }; do cf_zone "$domain" >/dev/null || { err "$domain 未授权"; return 1; }; done
+    dns_hooks || return 1
+    DNS_AUTH=(--manual --preferred-challenges dns --manual-auth-hook "$DNS_AUTH_HOOK" --manual-cleanup-hook "$DNS_CLEANUP_HOOK")
+    if certbot_cmd plugins 2>/dev/null | grep -q dns-cloudflare; then
+        DNS_CREDENTIALS=$(mktemp "$TX/dns.XXXXXXXX.credentials") || return 1
+        chmod 600 "$DNS_CREDENTIALS"
+        IFS= read -r token < "$STATE/cloudflare.token"
+        printf 'dns_cloudflare_api_token = %s\n' "$token" > "$DNS_CREDENTIALS"
+        DNS_AUTH=(--dns-cloudflare --dns-cloudflare-credentials "$DNS_CREDENTIALS" --dns-cloudflare-propagation-seconds 60)
+    fi
+}
+dns_renewal_config() {
+    # 插件临时凭据删除后，续期统一用读取当前 Token 的持久 hook。
+    python3 - "$LE/renewal/$(cert_id).conf" "$DNS_AUTH_HOOK" "$DNS_CLEANUP_HOOK" <<'PY'
+import sys,re
+path,auth,cleanup=sys.argv[1:]
+text=open(path).read()
+keys={'authenticator','manual_auth_hook','manual_cleanup_hook','pref_challs'}
+lines=[l for l in text.splitlines() if l.split('=',1)[0].strip() not in keys and not re.match(r'\s*dns_cloudflare_',l)]
+if '[renewalparams]' not in lines: lines.append('[renewalparams]')
+index=lines.index('[renewalparams]')+1
+# 插入到主 renewalparams，避免误写到尾部的 [[webroot_map]] 子节。
+lines[index:index]=['authenticator = manual','pref_challs = dns-01,','manual_auth_hook = '+auth,'manual_cleanup_hook = '+cleanup]
+open(path,'w').write('\n'.join(lines)+'\n')
+PY
+}
+dns_hook() {
+    local action=$1 domain=${CERTBOT_DOMAIN:-} zone payload data id rows type name content flag auth_id=${CERTBOT_AUTH_OUTPUT:-}
+    auth_id=${auth_id//$'\n'/}; auth_id=${auth_id//$'\r'/}
+    host_valid "$domain" && [[ ${CERTBOT_VALIDATION:-} =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    zone=$(cf_zone "$domain") || return 1
+    name=_acme-challenge.$domain
+    if [[ $action == _dns-auth ]]; then
+        payload=$(python3 - "$name" "$CERTBOT_VALIDATION" <<'PY'
+import json,sys
+print(json.dumps(dict(type='TXT',name=sys.argv[1],content=sys.argv[2],ttl=60)))
+PY
+)
+        data=$(cf_api POST "/zones/$zone/dns_records" "$payload") || return 1
+        id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["id"])' <<< "$data")
+        # certbot 将 stdout 传给 cleanup；不含 Token。
+        printf '%s\n' "$id"
+        sleep 60
+    else
+        rows=$(cf_records "$zone" "$name") || return 1
+        while IFS=$'\t' read -r id type name content flag; do
+            if [[ $type == TXT && $content == "$CERTBOT_VALIDATION" && $id == "$auth_id" ]]; then
+                cf_api DELETE "/zones/$zone/dns_records/$id" >/dev/null || return 1
+            fi
+        done <<< "$rows"
+    fi
 }
 
 main "$@"
