@@ -855,52 +855,233 @@ ngx —— nginx 管理
 --yes 用于删除确认；备份和恢复需要可信归档；详见 README.md。
 EOT
 }
-ui_add() {
-    local name type domain port upstream root tls email cf only args=()
-    ask name '名称: ' && ask type '类型 [emby]: ' emby && ask domain '域名（多个用逗号）: ' &&
-    ask port '端口 [10618]: ' 10618 && ask upstream '上游 [127.0.0.1:18618]: ' 127.0.0.1:18618 &&
-    ask root '静态目录 [/var/www/html]: ' /var/www/html && ask tls '启用 TLS？[Y/n]: ' Y && ask email '邮箱（可留空）: ' || return 1
-    [[ $tls != n && $tls != N ]] || args+=(--no-tls)
-    [[ -z $email ]] || args+=(--email "$email")
-    ask cf '启用 Cloudflare 模式？[y/N]: ' N || return 1
-    if [[ $cf == y || $cf == Y ]]; then
-        args+=(--cloudflare)
-        ask only '仅允许 Cloudflare 来源？[y/N]: ' N || return 1
-        [[ $only != y && $only != Y ]] || args+=(--cf-only)
-    fi
-    main add "$name" --type "$type" --domain "$domain" --port "$port" --upstream "$upstream" --root "$root" "${args[@]}"
+# ---------- 交互菜单（数字选择） ----------
+pause() { local _; read -r -s -p "  ${D}按回车返回…${N}" _ || true; echo; }
+confirm_y() { local a; read -r -p "  $1 [Y/n] " a || return 1; [[ -z $a || $a == y || $a == Y ]]; }
+site_names() { local f; for f in "$STATE"/sites/*.env; do [[ -e $f ]] || continue; f=${f##*/}; printf '%s\n' "${f%.env}"; done; }
+site_field() { sed -n "s/^$2=//p" "$STATE/sites/$1.env" 2>/dev/null | head -1; }
+type_label() { case $1 in emby) echo 'EmbyHub';; proxy) echo '反向代理';; static) echo '静态网站';; adopted) echo '接管';; *) echo "$1";; esac; }
+
+# pick_site 变量名 [提示]：列出站点，按编号选择
+pick_site() {
+    local -a names; local i n mark c
+    mapfile -t names < <(site_names)
+    ((${#names[@]})) || { warn '还没有站点，先用「2) 添加站点」'; return 1; }
+    echo
+    for i in "${!names[@]}"; do
+        n=${names[i]}
+        if (load_site "$n" >/dev/null 2>&1 && site_enabled >/dev/null 2>&1); then mark="${G}●${N}"; else mark="${D}○${N}"; fi
+        printf '   %s%2d%s) %s %s %s %s\n' "$BD" $((i + 1)) "$N" "$mark" "$(pad "$n" 14)" "$(pad "$(site_field "$n" DOMAINS)" 28)" "${D}$(type_label "$(site_field "$n" TYPE)")${N}"
+    done
+    hint '● 已启用  ○ 已停用'
+    ask c "${2:-选择站点编号}: " || return 1
+    if ! [[ $c =~ ^[0-9]+$ ]] || ((c < 1 || c > ${#names[@]})); then err '无效编号'; return 1; fi
+    printf -v "$1" '%s' "${names[c - 1]}"
 }
+
+ui_add() {
+    local t type name domain port upstream root email args=() def
+    title '添加站点'
+    echo "   1) EmbyHub 媒体服务   2) 反向代理（其他服务）   3) 静态网站"
+    ask t '站点类型 [1]: ' 1 || return 1
+    case $t in 1) type=emby;; 2) type=proxy;; 3) type=static;; *) err '无效选择'; return 1;; esac
+    ask domain '域名（多个用逗号分隔，如 emby.example.com）: ' || return 1
+    [[ -n $domain ]] || { err '域名不能为空'; return 1; }
+    name=${domain%%,*}; name=${name%%.*}
+    ask name "站点名称 [$name]: " "$name" || return 1
+    ask port '对外端口 [443]: ' 443 || return 1
+    if [[ $type == static ]]; then
+        ask root "网站目录 [/var/www/$name]: " "/var/www/$name" || return 1; args+=(--root "$root")
+    else
+        def=127.0.0.1:10618; [[ $type == emby ]] || def=127.0.0.1:8080
+        ask upstream "后端地址 [$def]: " "$def" || return 1; args+=(--upstream "$upstream")
+    fi
+    if confirm_y '启用 HTTPS 并自动申请 Let'"'"'s Encrypt 证书？（推荐）'; then
+        email=$(sed -n 's/^EMAIL=//p' "$STATE/config" 2>/dev/null)
+        ask email "证书通知邮箱${email:+ [$email]}（可留空）: " "$email" || return 1
+        [[ -z $email ]] || args+=(--email "$email")
+    else
+        args+=(--no-tls)
+    fi
+    if confirm '域名在 Cloudflare 开了橙云（代理）吗？'; then
+        args+=(--cloudflare)
+        confirm '只允许 Cloudflare 访问源站（隐藏真实 IP 时推荐）？' && args+=(--cf-only)
+    fi
+    echo; hint "将创建：$(type_label "$type") $domain → 端口 $port"
+    confirm_y '确认创建？' || return 1
+    main add "$name" --type "$type" --domain "$domain" --port "$port" "${args[@]}"
+}
+
+ui_modify() {
+    local name c v state
+    pick_site name '要修改哪个站点' || return 1
+    [[ $(site_field "$name" TYPE) == adopted ]] && { warn '这是接管的站点：可「查看/编辑配置」，或在 Cloudflare 菜单里转换为标准模板'; }
+    state=$(site_field "$name" CLOUDFLARE)
+    title "修改站点 $name"
+    echo "   1) 修改域名（当前 $(site_field "$name" DOMAINS)）"
+    echo "   2) 修改端口（当前 $(site_field "$name" PORT)）"
+    echo "   3) 修改后端地址（当前 $(site_field "$name" UPSTREAM)）"
+    echo "   4) Cloudflare 模式（当前 ${state:-off}）"
+    echo "   5) 查看配置文件"
+    echo "   6) 手动编辑配置（保存后自动检查，出错回滚）"
+    echo "   0) 返回"
+    ask c '请选择: ' || return 0
+    case $c in
+        1) ask v '新域名（多个用逗号）: ' && main set "$name" domain "$v";;
+        2) ask v '新端口: ' && main set "$name" port "$v";;
+        3) ask v '新后端地址（如 127.0.0.1:10618）: ' && main set "$name" upstream "$v";;
+        4) if [[ $state == on ]]; then confirm '关闭 Cloudflare 模式？' && main set "$name" cloudflare off
+           else confirm '开启 Cloudflare 模式（识别真实访客 IP）？' && main set "$name" cloudflare on; fi;;
+        5) main show "$name";;
+        6) main edit "$name";;
+        *) return 0;;
+    esac
+}
+
+ui_toggle() {
+    local name
+    pick_site name '启用/停用哪个站点' || return 1
+    if (load_site "$name" >/dev/null 2>&1 && site_enabled >/dev/null 2>&1); then
+        confirm "停用 $name？访问会立即中断" && main disable "$name"
+    else
+        confirm_y "启用 $name？" && main enable "$name"
+    fi
+}
+
+ui_remove() {
+    local name extra=()
+    pick_site name '删除哪个站点' || return 1
+    confirm "确定删除站点 $name？（配置会先备份）" || return 0
+    confirm '同时删除它的证书？' && extra+=(--purge-cert)
+    main rm "$name" --yes "${extra[@]}"
+}
+
+ui_cert() {
+    local c name
+    title '证书管理'
+    echo "   1) 查看所有证书和剩余天数"
+    echo "   2) 为站点申请 / 重新申请证书"
+    echo "   3) 立即续期所有证书"
+    echo "   4) 模拟续期（只检查，不改动）"
+    echo "   5) 删除不再使用的证书"
+    echo "   0) 返回"
+    ask c '请选择: ' || return 0
+    case $c in
+        1) main cert list;;
+        2) pick_site name '为哪个站点申请' && main cert issue "$name";;
+        3) confirm_y '现在续期？' && main cert renew;;
+        4) main cert renew --dry-run;;
+        5) pick_site name '删除哪个站点的证书' && confirm '确定删除？' && main cert rm "$name" --yes;;
+        *) return 0;;
+    esac
+}
+
+ui_logs() {
+    local name c n=50 args=()
+    pick_site name '查看哪个站点的日志' || return 1
+    echo "   1) 访问日志   2) 错误日志   3) 实时跟踪访问日志（Ctrl+C 结束）"
+    ask c '请选择 [1]: ' 1 || return 0
+    case $c in
+        1) ask n '显示最近多少行 [50]: ' 50; args=(-n "$n");;
+        2) ask n '显示最近多少行 [50]: ' 50; args=(--error -n "$n");;
+        3) args=(-f);;
+        *) return 0;;
+    esac
+    main logs "$name" "${args[@]}"
+}
+
+ui_top() {
+    local name c
+    pick_site name '统计哪个站点' || return 1
+    echo "   1) 最近 1000 条请求   2) 最近 1 小时   3) 最近 24 小时"
+    ask c '请选择 [1]: ' 1 || return 0
+    case $c in 2) main top "$name" --since 1h;; 3) main top "$name" --since 24h;; *) main top "$name";; esac
+}
+
+ui_cloudflare() {
+    local c name t
+    title 'Cloudflare 与站点接管'
+    echo "   1) 更新 Cloudflare IP 段（每周也会自动更新）"
+    echo "   2) 开/关站点的 Cloudflare 模式"
+    echo "   3) 扫描并接管服务器上已有的 nginx 站点"
+    echo "   4) 把接管的站点转换为 ngx 标准模板"
+    echo "   0) 返回"
+    ask c '请选择: ' || return 0
+    case $c in
+        1) main cf update;;
+        2) pick_site name && if [[ $(site_field "$name" CLOUDFLARE) == on ]]; then confirm "关闭 $name 的 Cloudflare 模式？" && main set "$name" cloudflare off; else confirm_y "开启 $name 的 Cloudflare 模式？" && main set "$name" cloudflare on; fi;;
+        3) main adopt --dry-run; confirm_y '按上面的结果接管？' && main adopt;;
+        4) pick_site name '转换哪个站点' || return 1
+           echo "   1) EmbyHub   2) 反向代理   3) 静态网站"; ask t '转换为 [2]: ' 2 || return 0
+           case $t in 1) t=emby;; 3) t=static;; *) t=proxy;; esac
+           main convert "$name" --type "$t";;
+        *) return 0;;
+    esac
+}
+
+ui_backup() {
+    local c i f
+    local -a files
+    title '备份与恢复'
+    echo "   1) 立即备份（不含证书私钥）"
+    echo "   2) 立即备份（包含证书私钥，请妥善保管）"
+    echo "   3) 从备份恢复"
+    echo "   0) 返回"
+    ask c '请选择: ' || return 0
+    case $c in
+        1) main backup;;
+        2) main backup --with-keys;;
+        3) mapfile -t files < <(ls -1t "$BACK"/*.tar.gz 2>/dev/null)
+           ((${#files[@]})) || { warn '还没有备份'; return 1; }
+           for i in "${!files[@]}"; do printf '   %s%2d%s) %s\n' "$BD" $((i + 1)) "$N" "${files[i]##*/}"; done
+           ask f '选择备份编号: ' || return 0
+           if ! [[ $f =~ ^[0-9]+$ ]] || ((f < 1 || f > ${#files[@]})); then err '无效编号'; return 1; fi
+           confirm "用 ${files[f - 1]##*/} 恢复？（恢复前会先检查，失败不生效）" && main restore "${files[f - 1]}";;
+        *) return 0;;
+    esac
+}
+
 menu() {
-    local choice name field value mode line args
+    trap 'echo; exit 130' INT
+    local c state count test_state
     while true; do
-        title 'ngx nginx 管理'
-        echo '  status 状态   add 添加   edit 编辑   rm 删除   show 查看'
-        echo '  enable 启用   disable 停用   set 设置   cert 证书'
-        echo '  test 检查   reload 重载   restart 重启   logs 日志   top 统计'
-        echo '  backup 备份   restore 恢复   install 安装   doctor 诊断   help 帮助'
-        echo '  cf 更新 CF 地址   adopt 接管   convert 转换'
-        echo '  0 退出（输入上方英文命令）'
-        ask choice '请选择: ' || return 0
-        case $choice in
-            0|q|'') return 0;;
-            add) (ui_add);;
-            edit|rm|show|enable|disable) ask name '名称: ' && (main "$choice" "$name");;
-            set) ask name '名称: ' && ask field '字段 upstream|port|domain|cloudflare: ' && ask value '值: ' && (main set "$name" "$field" "$value");;
-            cert)
-                ask mode 'issue|renew|list|rm: ' || continue
-                case $mode in issue|rm) ask name '名称: ' && (main cert "$mode" "$name");;
-                    renew) if confirm '模拟续期？'; then (main cert renew --dry-run); else (main cert renew); fi;;
-                    list) (main cert list);; *) err '无效选择';; esac;;
-            cf) (main cf update);;
-            adopt) if confirm '只预览？'; then (main adopt --dry-run); else (main adopt); fi;;
-            convert) ask line '名称和转换选项（例如 demo --type proxy --port 8443）: ' && { read -r -a args <<< "$line"; (main convert "${args[@]}"); };;
-            logs|top) ask line '参数（空格分隔，例如 demo -n 20 或 demo --since 1h）: ' && { read -r -a args <<< "$line"; (main "$choice" "${args[@]}"); };;
-            backup) if confirm '包含证书私钥？'; then (main backup --with-keys); else (main backup); fi;;
-            restore) ask value '备份文件路径: ' && (main restore "$value");;
-            status|test|reload|restart|install|doctor|help) (main "$choice");;
-            *) err '无效选择';;
+        clear 2>/dev/null || true
+        count=$(site_names | grep -c .)
+        if systemctl is-active --quiet nginx 2>/dev/null; then state="${G}● 运行中${N}"; else state="${R}● 未运行${N}"; fi
+        if nginx -t >/dev/null 2>&1; then test_state="${G}配置正常${N}"; else test_state="${R}配置有错误（选 9 诊断）${N}"; fi
+        echo
+        echo "  ${BD}${C}ngx 网站管理${N}   ${D}$(hostname)${N}"
+        echo "  nginx $state · 站点 ${BD}$count${N} 个 · $test_state"
+        echo "  ${D}──────────────────────────────────────${N}"
+        echo "   ${BD}1${N}) 查看状态          ${BD}6${N}) 证书管理 ▸"
+        echo "   ${BD}2${N}) 添加站点          ${BD}7${N}) 查看日志"
+        echo "   ${BD}3${N}) 修改站点 ▸        ${BD}8${N}) 访问统计"
+        echo "   ${BD}4${N}) 启用 / 停用站点   ${BD}9${N}) 诊断问题"
+        echo "   ${BD}5${N}) 删除站点          ${BD}c${N}) Cloudflare / 接管 ▸"
+        echo "   ${BD}b${N}) 备份 / 恢复 ▸     ${BD}r${N}) 重新加载 nginx"
+        echo "   ${BD}i${N}) 安装 / 修复环境   ${BD}h${N}) 命令行用法"
+        echo "   ${BD}0${N}) 退出"
+        echo
+        read -r -p "  请选择: " c || { echo; exit 0; }
+        case $c in
+            1) (main status);;
+            2) (ui_add);;
+            3) (ui_modify);;
+            4) (ui_toggle);;
+            5) (ui_remove);;
+            6) (ui_cert);;
+            7) (ui_logs);;
+            8) (ui_top);;
+            9) (main doctor);;
+            c|C) (ui_cloudflare);;
+            b|B) (ui_backup);;
+            r|R) (main reload);;
+            i|I) (main install);;
+            h|H) (main help);;
+            0|q|Q|'') echo; exit 0;;
+            *) continue;;
         esac
-        read -r -s -p "  ${D}按回车返回菜单…${N}" line || return 0; echo
+        echo; pause
     done
 }
 main() {
