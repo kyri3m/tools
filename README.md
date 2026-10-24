@@ -1,25 +1,25 @@
 # tools
 
-两个单文件 Bash 工具，用中文界面管理 Debian 服务器的防火墙和 nginx 网站。
+两个单文件工具，用中文界面管理服务器的防火墙（fw，Bash）和 nginx 网站（ngx，Python 标准库）。
 
 | 工具 | 用途 | 手册 |
 | --- | --- | --- |
 | `fw` | 管理 nftables 端口、白名单、IP 封禁和拦截日志 | [fw 手册](docs/fw.md) |
-| `ngx` | 管理 nginx 网站、HTTPS 证书、Cloudflare DNS 和备份 | [ngx 手册](docs/ngx.md) |
+| `ngx` | 一条命令把本机服务反代成 HTTPS 网站：自动 Cloudflare 解析、证书、nginx 配置 | [ngx 手册](docs/ngx.md) |
 
 ## 快速安装
 
-适用于 Debian 12/13，需要 root 和 nftables；`ngx install` 会自动安装缺少的 nginx/certbot。ngx 的其他依赖和版本要求见手册。
+fw 适用于 Debian 12/13（需要 nftables）；ngx 适用于 Debian / Ubuntu / RHEL 系，`ngx install` 会自动安装 nginx、certbot。
 
 ```bash
 gh repo clone kyri3m/tools
 # 或：git clone git@github.com:kyri3m/tools.git
 cd tools
 # 以下命令以 root 执行
-install -m755 fw ngx /usr/local/bin/
+sh install.sh      # 安装 fw、ngx 并初始化 nginx（会补装 python3）
 fw                 # 进入防火墙菜单，首次运行初始化规则
-ngx install        # 安装依赖并初始化 nginx
-ngx                # 进入网站面板
+ngx cf token set   # 可选：有 Cloudflare 时，新建网站会自动解析 DNS
+ngx add app.example.com 3000   # 反代本机 3000 端口
 ```
 
 这是私有仓库，克隆前需有仓库访问权限；使用 gh 时先登录，使用 SSH 时先配置密钥。
@@ -43,14 +43,13 @@ ngx                # 进入网站面板
 `ngx` 网站面板：
 
 ```text
-  ngx 网站管理    nginx 运行中 · 2 个网站 · 一切正常
-  ─────────────────────────────────────────────────────────
-   网站    状态      域名              证书          Cloudflare
-   1 emby  ● 在线    emby.example.com  剩 89 天      灰云
-   2 blog  ○ 已停用  blog.example.com  未启用 HTTPS  橙云
-  ─────────────────────────────────────────────────────────
-   1-9) 管理网站   n) 新建网站   c) Cloudflare
-   d) 一键体检     b) 备份恢复   0) 退出
+  ngx 2.0.0  ·  nginx 运行中  ·  Cloudflare 已连接
+
+  #  网站  域名              后端    状态        HTTPS     DNS
+  1  app   app.example.com   :3000   ● 在线      剩 89 天  灰云
+  2  blog  blog.example.com  :8080   ● 后端不通  剩 61 天  橙云
+
+  a 新建反代   s 扫描本机服务   c Cloudflare   d 体检   b 备份   q 退出
 ```
 
 ## 常见用法
@@ -58,24 +57,24 @@ ngx                # 进入网站面板
 ```bash
 fw open 8443 tcp                       # 放行 TCP 端口
 fw block 203.0.113.10                   # 封禁来源 IP
-ngx add web --type proxy --domain web.example.com --port 443 --upstream 127.0.0.1:8080  # 新建反向代理网站
-ngx cf token set                       # 隐藏输入 Cloudflare Token
-ngx dns add emby.example.com A 203.0.113.5 --proxied off  # 添加域名解析
-ngx                                    # 选网站 → 8，切换橙云/灰云（橙云用 Full (strict)）
-ngx doctor                             # 一键体检
+ngx scan                               # 本机哪些端口在监听、还没反代
+ngx add app.example.com 3000           # 解析 DNS + 申请证书 + 反代，一步完成
+ngx route app add /api/ 3001           # 按路径分流
+ngx cf proxied app on                  # 切换橙云，nginx 同步信任 CF 真实 IP
+ngx doctor --fix                       # 体检并自动修复
 ngx backup                             # 普通备份，默认排除 Token 和私钥
 ```
 
 ## 配合使用
 
-ngx 不会自行开放防火墙端口；需要用户确认或显式指定 `--open-firewall` 才会调用 fw。建议先用 fw 放行 HTTP/HTTPS，再创建网站：
+ngx 新建网站时会检查 fw 是否已放行 80 和网站端口，经用户确认（或 `--open-firewall`）后调用 `fw open`；没有 fw 时退回 ufw，都没有则只做提示。也可以提前放行：
 
 ```bash
 fw open 80 tcp
 fw open 443 tcp
 ```
 
-HTTP-01 签发需要 80 端口；自定义网站端口也需放行，并自行配置云安全组和 NAT。
+HTTP 验证需要 80 端口；设置了 Cloudflare Token 时改用 DNS 验证，不需要 80。云安全组和 NAT 需自行配置。
 
 ## 数据与安全
 
@@ -86,8 +85,8 @@ Cloudflare Token 保存在 `/etc/ngx/cloudflare.token`，仅 root 可读写（06
 ## 开发与测试
 
 ```bash
-shellcheck fw ngx test/*.sh
-bash test/run.sh
+shellcheck fw test/run.sh
+bash test/run.sh        # ngx 隔离测试：临时根目录 + certbot 桩 + 本地假 Cloudflare API
 ```
 
-测试使用仓库内临时目录和命令桩，不修改真实服务器配置。`test/followup.sh` 和 `test/v3.sh` 由 `test/run.sh` source，切勿直接运行；测试所需依赖见 [ngx 手册](docs/ngx.md#隔离测试)。
+测试只在临时目录里运行，不修改真实服务器配置，也不访问真实 Cloudflare；需要本机有 nginx、python3、openssl。
