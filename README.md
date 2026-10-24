@@ -12,17 +12,14 @@
 fw 适用于 Debian 12/13（需要 nftables）；ngx 适用于 Debian / Ubuntu / RHEL 系，`ngx install` 会自动安装 nginx、certbot。
 
 ```bash
-gh repo clone kyri3m/tools
-# 或：git clone git@github.com:kyri3m/tools.git
-cd tools
-# 以下命令以 root 执行
-sh install.sh      # 安装 fw、ngx 并初始化 nginx（会补装 python3）
+# root 执行：安装 fw、ngx 并初始化 nginx（会补装 python3、nginx、certbot）
+curl -fsSL https://raw.githubusercontent.com/kyri3m/tools/main/install.sh | sh
+
 fw                 # 进入防火墙菜单，首次运行初始化规则
 ngx cf token set   # 可选：有 Cloudflare 时，新建网站会自动解析 DNS
 ngx add app.example.com 3000   # 反代本机 3000 端口
 ```
 
-这是私有仓库，克隆前需有仓库访问权限；使用 gh 时先登录，使用 SSH 时先配置密钥。
 
 ## 主界面
 

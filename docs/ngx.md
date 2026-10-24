@@ -16,10 +16,10 @@ ngx add app.example.com 3000
 
 ## 安装
 
-在本仓库目录里以 root 运行（Debian / Ubuntu / RHEL 系）：
+root 运行（Debian / Ubuntu / RHEL 系）：
 
 ```bash
-sh install.sh                          # 安装 fw、ngx，并执行 ngx install
+curl -fsSL https://raw.githubusercontent.com/kyri3m/tools/main/install.sh | sh   # 安装 fw、ngx 并初始化
 ngx install --email you@example.com    # 证书到期通知邮箱（可选）
 ngx cf token set                       # 可选：Cloudflare API Token
 ```
