@@ -35,7 +35,7 @@ Cloudflare Token 创建：My Profile → API Tokens → Create Token → 模板�
 ngx                                  # 交互菜单
 ngx scan                             # 本机有哪些端口在监听、哪些还没反代
 ngx add app.example.com 3000         # 反代本机 3000
-ngx add a.com,www.a.com 8080         # 多个域名
+ngx add example.com,www.example.com 8080        # 多个域名
 ngx add files.example.com /srv/www   # 静态目录
 ngx add app.example.com 3000 --proxied   # 橙云代理
 ngx ls                               # 网站列表：在线状态、证书剩余天数、DNS 指向
