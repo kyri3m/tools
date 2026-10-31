@@ -27,7 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '2.0.0'
+VERSION = '2.1.0'
 
 # ---------- 路径 ----------
 # NGX_ROOT 仅用于隔离测试：所有文件落在测试根下，系统命令改为空操作。
@@ -383,6 +383,8 @@ proxy_set_header X-Forwarded-Port $server_port;
 proxy_redirect off;
 gzip on;
 gzip_proxied any;
+gzip_vary on;
+gzip_min_length 1024;
 gzip_types text/plain text/css application/javascript application/json application/xml image/svg+xml;
 ''',
         'ngx-acme.conf': f'''{MARK}
@@ -398,9 +400,10 @@ location ^~ /.well-known/acme-challenge/ {{
     for name, content in snippets.items():
         write(f'{ETC}/snippets/{name}', content)
     write(f'{ETC}/conf.d/ngx-http.conf', f'''{MARK}
+# 非 WebSocket 请求发空 Connection 头，配合 upstream keepalive 复用到后端的连接。
 map $http_upgrade $connection_upgrade {{
     default upgrade;
-    '' close;
+    '' '';
 }}
 log_format ngx '$remote_addr - $remote_user [$time_local] "$request" '
                '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
@@ -423,6 +426,13 @@ server {{
     include {ETC}/snippets/ngx-acme.conf;
     location / {{ return 404; }}
 }}
+# 443 兜底：未知域名或直连 IP 直接拒绝 TLS 握手，不暴露任何网站的证书。
+server {{
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}}
 ''')
     symlink(f'{ETC}/sites-available/ngx-acme-80.conf', f'{ETC}/sites-enabled/ngx-acme-80.conf')
 
@@ -440,13 +450,26 @@ def render(site):
     gate = ['if ($ngx_cf_peer = 0) { return 403; }'] if site['cf_only'] else []
     port = site['port']
 
+    pools = {}  # 后端地址 → upstream 名；http/unix 后端走 upstream 以便 keepalive
+
+    def pool_target(upstream):
+        if upstream.startswith('https://'):
+            return proxy_target(upstream)
+        if upstream.startswith('unix:'):
+            server, path = f'unix:{ROOT}{upstream[5:]}', ''
+        else:
+            server, slash, path = upstream[7:].partition('/')
+            path = slash + path
+        pool = pools.setdefault(server, f'ngx_{name}_{len(pools)}')
+        return f'http://{pool}{path}'
+
     def proxy_block(upstream):
         lines = gate + [f'include {ETC}/snippets/ngx-proxy.conf;',
                         f'proxy_set_header X-Forwarded-For {xff};',
                         f'proxy_set_header X-Forwarded-Proto {scheme};']
         if upstream.startswith('https://'):
             lines.append('proxy_ssl_server_name on;')
-        return lines + [f'proxy_pass {proxy_target(upstream)};']
+        return lines + [f'proxy_pass {pool_target(upstream)};']
 
     def location(spec, body):
         head = f'= {spec[1:]}' if spec.startswith('=') else spec
@@ -455,7 +478,7 @@ def render(site):
     out = [MARK, f'# 由 ngx 生成，请勿手改：用 ngx set/route 修改；自定义片段写在 {CUSTOM}/{name}.conf', 'server {']
     ssl_flag = ' ssl' if tls else ''
     out += [f'    listen {port}{ssl_flag};', f'    listen [::]:{port}{ssl_flag};', f'    server_name {names};',
-            f'    access_log {LOG}/ngx-{name}.access.log ngx;', f'    error_log {LOG}/ngx-{name}.error.log;']
+            f'    access_log {LOG}/ngx-{name}.access.log ngx buffer=32k flush=5s;', f'    error_log {LOG}/ngx-{name}.error.log;']
     if site['headers']:
         out.append(f'    include {ETC}/snippets/ngx-security.conf;')
     out.append(f'    include {ETC}/snippets/ngx-acme.conf;')
@@ -491,6 +514,11 @@ def render(site):
         target = f'{scheme}://$host' + ('' if (tls and port == 443) or (not tls and port == 80) else f':{port}') + '$request_uri'
         out += ['server {', '    listen 80;', '    listen [::]:80;', f'    server_name {names};',
                 f'    include {ETC}/snippets/ngx-acme.conf;', f'    location / {{ return 301 {target}; }}', '}']
+    head = []
+    for server, pool in pools.items():
+        head += [f'upstream {pool} {{', f'    server {server};', '    keepalive 32;', '}']
+    if head:
+        out[2:2] = head
     return '\n'.join(out) + '\n'
 
 def validate(site):

@@ -52,6 +52,7 @@ check 'install 加上 worker_rlimit_nofile' 'grep -q "^worker_rlimit_nofile 1048
 ngx install >/dev/null
 check '重复 install 不重复写入' '[[ $(grep -c worker_rlimit_nofile "$R/etc/nginx/nginx.conf") == 1 && $(grep -c worker_connections "$R/etc/nginx/nginx.conf") == 1 ]]'
 check '生成 ACME 兜底站点' '[[ -L $R/etc/nginx/sites-enabled/ngx-acme-80.conf ]]'
+check '443 兜底拒绝握手' 'grep -q "listen 443 ssl default_server;" "$R/etc/nginx/sites-available/ngx-acme-80.conf" && grep -q ssl_reject_handshake "$R/etc/nginx/sites-available/ngx-acme-80.conf"'
 echo IPV4=203.0.113.7 > "$R/etc/ngx/config"
 
 echo '■ 无 Token 新建'
@@ -79,7 +80,9 @@ ngx route app add /api/ 127.0.0.1:3080/v1 >/dev/null
 ngx route app add =/health 3000 >/dev/null
 check '前缀路由' 'conf app | grep -q "location /api/"'
 check '精确路由' 'conf app | grep -q "location = /health"'
-check '路由改写路径' 'conf app | grep -q "proxy_pass http://127.0.0.1:3080/v1;"'
+check '路由改写路径' 'conf app | grep -q "proxy_pass http://ngx_app_[0-9]/v1;"'
+check '后端走 upstream keepalive' 'conf app | grep -q "keepalive 32;" && conf app | grep -q "server 127.0.0.1:3080;"'
+check '同一后端只定义一次 upstream' '[[ $(conf app | grep -c "server 127.0.0.1:5199;") == 1 ]]'
 ngx set app body 1g >/dev/null && ngx allow app add 10.0.0.0/8 >/dev/null
 echo test1234 | python3 "$BASE/ngx" auth app set admin >/dev/null
 check '上传上限' 'conf app | grep -q "client_max_body_size 1g"'
