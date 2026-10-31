@@ -61,5 +61,6 @@ fw            # 进入数字菜单
 | `/etc/fw/allowlist` | 每行：`IP或网段 备注` |
 | `/etc/fw/blocklist` | 每行：`IP或网段 备注` |
 | `/etc/nftables.conf` | 由 fw 生成，勿手改 |
+| `/etc/systemd/system/fw.service` | 由 fw 生成：开机加载规则（不用发行版的 nftables.service，它停止时会清空 Docker、fail2ban 的规则） |
 
 这些是服务器自己的状态，不放进仓库。迁移服务器时复制 `/etc/fw/` 后执行 `fw reload`。

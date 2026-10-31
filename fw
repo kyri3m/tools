@@ -12,6 +12,7 @@ BLOCKS=$FW_DIR/blocklist     # 每行：IP或网段 备注
 ALLOWS=$FW_DIR/allowlist     # 每行：IP或网段 备注（始终放行）
 NFT_CONF=/etc/nftables.conf
 F2B_IGNORE=/etc/fail2ban/jail.d/fw-allowlist.local
+FW_UNIT=/etc/systemd/system/fw.service
 
 if [[ -t 1 ]]; then
 	R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' D=$'\e[2m' BD=$'\e[1m' N=$'\e[0m'
@@ -192,15 +193,18 @@ $(elems "$b6")
 		# 容器访问宿主机上的服务（docker0 是默认网络，br-* 是自建网络）
 		iifname "docker0" accept
 		iifname "br-*" accept
-		# 白名单优先于黑名单和端口规则
-		ip saddr @allow4 counter accept comment "allowlist"
-		ip6 saddr @allow6 counter accept comment "allowlist"
-		ip saddr @block4 counter drop comment "blocklist"
-		ip6 saddr @block6 counter drop comment "blocklist"
+		# 白名单优先于黑名单：白名单里的地址不会被黑名单拦（黑名单先于 established，封禁对已有连接立即生效）
+		ip saddr @block4 ip saddr != @allow4 counter drop comment "blocklist"
+		ip6 saddr @block6 ip6 saddr != @allow6 counter drop comment "blocklist"
+		# 已建立的连接直接放行，绝大多数数据包到这里就结束，不再查后面的集合
 		ct state established,related accept
 		ct state invalid drop
+		ip saddr @allow4 counter accept comment "allowlist"
+		ip6 saddr @allow6 counter accept comment "allowlist"
 
-		# ICMP（ping、PMTU 发现）；IPv6 邻居发现必须放行，否则 IPv6 会断
+		# ICMP（ping、PMTU 发现）；ping 限速防洪泛；IPv6 邻居发现必须放行，否则 IPv6 会断
+		icmp type echo-request limit rate over 20/second burst 50 packets drop
+		icmpv6 type echo-request limit rate over 20/second burst 50 packets drop
 		ip protocol icmp accept
 		ip6 nexthdr icmpv6 accept
 
@@ -221,11 +225,11 @@ $(elems "$b6")
 		iifname "docker0" accept
 		iifname "br-*" accept
 
+		ip saddr @block4 ip saddr != @allow4 counter drop comment "blocklist"
+		ip6 saddr @block6 ip6 saddr != @allow6 counter drop comment "blocklist"
+		ct state established,related accept
 		ip saddr @allow4 counter accept comment "allowlist"
 		ip6 saddr @allow6 counter accept comment "allowlist"
-		ip saddr @block4 counter drop comment "blocklist"
-		ip6 saddr @block6 counter drop comment "blocklist"
-		ct state established,related accept
 
 		# 按"宿主机上的端口"（DNAT 之前的端口）判断是否放行
 		ct status dnat meta l4proto tcp ct original proto-dst != @tcp_open counter drop comment "dropped"
@@ -249,6 +253,37 @@ apply() { # 生成配置 → 校验 → 加载
 		return 1
 	fi
 	sync_f2b
+	ensure_boot
+}
+
+# 开机自动加载规则。不用发行版的 nftables.service：它停止时会 flush ruleset，连 Docker 和 fail2ban 的规则一起清掉。
+ensure_boot() {
+	[[ -d /run/systemd/system ]] || return 0
+	local nft unit
+	nft=$(command -v nft)
+	unit="# 由 fw 自动生成：开机加载 $NFT_CONF（只重建 inet host 表，不影响 Docker、fail2ban）
+[Unit]
+Description=fw firewall rules
+Wants=network-pre.target
+Before=network-pre.target docker.service fail2ban.service shutdown.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$nft -f $NFT_CONF
+ExecReload=$nft -f $NFT_CONF
+
+[Install]
+WantedBy=sysinit.target"
+	if [[ ! -f $FW_UNIT || $(<"$FW_UNIT") != "$unit" ]]; then
+		echo "$unit" > "$FW_UNIT"
+		systemctl daemon-reload
+	fi
+	if ! systemctl is-enabled -q fw.service 2>/dev/null; then
+		systemctl enable -q fw.service && ok "已设置开机自动加载防火墙规则（fw.service）"
+	fi
+	systemctl is-active -q fw.service || systemctl start fw.service >/dev/null 2>&1 || true
 }
 
 # 把白名单同步为 fail2ban 的 ignoreip，白名单 IP 永远不会被 fail2ban 封禁
@@ -341,6 +376,11 @@ cmd_status() {
 
 	title "防火墙概况"
 	echo "  状态      $active"
+	if systemctl is-enabled -q fw.service 2>/dev/null; then
+		echo "  开机加载  ${G}已启用${N}（fw.service）"
+	elif [[ -d /run/systemd/system ]]; then
+		echo "  开机加载  ${R}未启用，重启后防火墙失效${N}（运行 fw reload 修复）"
+	fi
 	echo "  SSH 端口  $(ssh_ports | paste -sd' ')（受保护，不允许关闭）"
 	echo "  已拦截    $(counter_of dropped) 个数据包（从上次加载规则起算）"
 
