@@ -11,6 +11,8 @@
 
 fw 适用于 Debian 12/13（需要 nftables）；ngx 适用于 Debian / Ubuntu / RHEL 系，`ngx install` 会自动安装 nginx、certbot。
 
+install.sh 顺带把系统上限调到够用：`fs.file-max`、inotify 实例/监听数、`nofile`（limits.d 和 systemd `DefaultLimitNOFILE`）都到 1048576 级别；只调高不调低，已配置过的不动。不想要就加 `TOOLS_NO_TUNE=1`。
+
 ```bash
 # root 执行：安装 fw、ngx 并初始化 nginx（会补装 python3、nginx、certbot）
 curl -fsSL https://raw.githubusercontent.com/kyri3m/tools/main/install.sh | sh

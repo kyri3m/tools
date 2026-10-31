@@ -23,4 +23,30 @@ python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$dir/ngx" || {
 bash -n "$dir/fw" || { echo "fw 文件不完整"; exit 1; }
 install -m 755 "$dir/fw" "$dir/ngx" /usr/local/bin/
 echo "  ✔ 已安装 /usr/local/bin/fw 和 /usr/local/bin/ngx"
+
+# 文件句柄 / inotify 上限：只调高不调低，已够大的项不写。TOOLS_NO_TUNE=1 跳过。
+if [ "${TOOLS_NO_TUNE:-0}" != 1 ]; then
+    tune=""
+    for kv in fs.file-max=1048576 fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=1048576; do
+        k=${kv%%=*}; v=${kv#*=}
+        cur=$(sysctl -n "$k" 2>/dev/null || echo 0)
+        [ "$cur" -lt "$v" ] 2>/dev/null && tune="$tune$k=$v
+"
+    done
+    if [ -n "$tune" ]; then
+        printf '%s' "$tune" > /etc/sysctl.d/90-tools-limits.conf
+        sysctl -q -p /etc/sysctl.d/90-tools-limits.conf || true
+    fi
+    if [ "$(ulimit -Hn)" != unlimited ] && [ "$(ulimit -Hn)" -lt 1048576 ] && [ -d /etc/security/limits.d ] \
+        && ! grep -rqs nofile /etc/security/limits.conf /etc/security/limits.d/; then
+        printf '* soft nofile 1048576\n* hard nofile 1048576\nroot soft nofile 1048576\nroot hard nofile 1048576\n' \
+            > /etc/security/limits.d/90-tools-nofile.conf
+    fi
+    if [ -d /run/systemd/system ] && ! grep -rqs '^DefaultLimitNOFILE' /etc/systemd/system.conf /etc/systemd/system.conf.d/; then
+        mkdir -p /etc/systemd/system.conf.d
+        printf '[Manager]\nDefaultLimitNOFILE=1048576\n' > /etc/systemd/system.conf.d/90-tools-nofile.conf
+        systemctl daemon-reexec || true
+    fi
+    echo "  ✔ 文件句柄 / inotify 上限已检查"
+fi
 /usr/local/bin/ngx install

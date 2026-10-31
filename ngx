@@ -1841,6 +1841,7 @@ def cmd_install(a):
         else:
             raise Fail('不认识的系统包管理器，请手动安装：' + ' '.join(missing))
     ensure_nginx_includes()
+    tune_nginx_conf()
     with Tx() as tx:
         layout()
         for s in all_sites():
@@ -1874,6 +1875,27 @@ def ensure_nginx_includes():
             shutil.copy2(conf, conf + '.ngx-bak')
             write(conf, new)
             ok('已在 nginx.conf 中加入 sites-enabled')
+
+def tune_nginx_conf():
+    """发行版默认 worker_connections 偏小（Debian 768）；只调高，不调低。"""
+    conf = f'{ETC}/nginx.conf'
+    text = read(conf)
+    if not text:
+        return
+    new = text
+    m = re.search(r'^(\s*)worker_connections\s+(\d+)\s*;', new, re.M)
+    if m and int(m.group(2)) < 65535:
+        new = new[:m.start()] + m.group(1) + 'worker_connections 65535;' + new[m.end():]
+    elif not m:
+        new = re.sub(r'events\s*\{', 'events {\n    worker_connections 65535;', new, count=1)
+    if not re.search(r'^\s*worker_rlimit_nofile\b', new, re.M):
+        new, n = re.subn(r'^(\s*worker_processes\b[^;]*;)', r'\1\nworker_rlimit_nofile 1048576;', new, count=1, flags=re.M)
+        if not n:
+            new = 'worker_rlimit_nofile 1048576;\n' + new
+    if new != text:
+        shutil.copy2(conf, conf + '.ngx-bak')
+        write(conf, new)
+        ok('已调高 nginx 连接数上限（worker_connections 65535，worker_rlimit_nofile 1048576）')
 
 def cmd_backup(a):
     os.makedirs(BACK, mode=0o700, exist_ok=True)

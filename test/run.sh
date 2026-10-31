@@ -47,6 +47,10 @@ conf() { cat "$R/etc/nginx/sites-available/ngx-$1.conf"; }
 echo '■ 安装'
 ngx install >/dev/null
 check 'install 补上 sites-enabled include' 'grep -q sites-enabled "$R/etc/nginx/nginx.conf"'
+check 'install 调高 worker_connections' 'grep -q "worker_connections 65535;" "$R/etc/nginx/nginx.conf"'
+check 'install 加上 worker_rlimit_nofile' 'grep -q "^worker_rlimit_nofile 1048576;" "$R/etc/nginx/nginx.conf"'
+ngx install >/dev/null
+check '重复 install 不重复写入' '[[ $(grep -c worker_rlimit_nofile "$R/etc/nginx/nginx.conf") == 1 && $(grep -c worker_connections "$R/etc/nginx/nginx.conf") == 1 ]]'
 check '生成 ACME 兜底站点' '[[ -L $R/etc/nginx/sites-enabled/ngx-acme-80.conf ]]'
 echo IPV4=203.0.113.7 > "$R/etc/ngx/config"
 

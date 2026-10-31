@@ -26,6 +26,8 @@ ngx cf token set                       # 可选：Cloudflare API Token
 
 依赖：Python 3.8+（只用标准库）、nginx、certbot、curl、openssl。`ngx install` 会自动安装缺的包。
 
+`ngx install` 还会把 nginx.conf 里偏小的 `worker_connections` 调到 65535，并加上 `worker_rlimit_nofile 1048576`（只调高不调低，改前备份为 `nginx.conf.ngx-bak`）。
+
 Cloudflare Token 创建：My Profile → API Tokens → Create Token → 模板「Edit zone DNS」。
 权限：`Zone · DNS · Edit` + `Zone · Zone · Read`，资源只选需要的域名。
 
