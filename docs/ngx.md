@@ -37,7 +37,9 @@ Cloudflare Token 创建：My Profile → API Tokens → Create Token → 模板�
 
 queryless access 仅保留时间、状态码、字节数和请求/上游计时，不包含 URL、路径、query、用户名、Host、Referer、User-Agent 或其他请求头。不能仅删 `$args`：`$request`、`$request_uri` 和 Referer 等同样可能携带凭据。
 
-**代价：queryless 将 HTTP 上下文及所有受管 server 的原生 `error_log` 指向 `/dev/null`，丢弃原生请求错误详情，而不是将错误日志“脱敏”。** nginx 1.26 原生 error_log 无类似 log_format 的字段控制，升至 crit/emerg 仍不能保证消息不附带原始 request；仅代理 location 设置还会遗漏默认 server、ACME、跳转和解析早期错误。安全 access 的 4xx/5xx 与计时仍可用于监控。`ngx top` 依赖 IP/路径字段，在 queryless 下明确拒绝，不会把无法解析的安全日志误报成零请求；改用 `ngx logs` 或状态码监控。进程启动/配置错误仍由 nginx 自身运维通道报告；不要对含真实秘密的配置运行日志转储。
+**代价：queryless 将主配置顶层、HTTP 上下文及所有受管 server 的原生 `error_log` 指向 `/dev/null`，丢弃原生请求错误详情，而不是将错误日志“脱敏”。** nginx 1.26 原生 error_log 无类似 log_format 的字段控制，升至 crit/emerg 仍不能保证消息不附带原始 request；仅代理 location 设置还会遗漏默认 server、ACME、跳转和解析早期错误。安全 access 的 4xx/5xx 与计时仍可用于监控。`ngx top` 依赖 IP/路径字段，在 queryless 下明确拒绝，不会把无法解析的安全日志误报成零请求；改用 `ngx logs` 或状态码监控。`nginx -t`/重载命令的失败仍由运维命令报告，但不保证保留运行期的原生进程错误详情；不要对含真实秘密的配置运行日志转储。
+
+转换支持发行版主 `nginx.conf` 的标准静态日志语句：仅按解析语句的原文跨度将顶层/HTTP 的 `error_log` 改为 `/dev/null`，HTTP `access_log` 改为 `off`，其余注释、空白、指令和文件权限保留；缺少顶层错误日志时补显式 `/dev/null`。受管站点仍生成各自安全 access 日志，不在主文件提前引用稍后 include 才定义的格式。主配置会纳入同一事务的字节和权限快照，校验/重载失败完整恢复。带变量、syslog、复杂多参数日志表达式和主文件符号链接保守拒绝，不能部分转换后声称成功。切回 `standard` 恢复生成器的站点日志策略，不自动还原主文件的原始日志语句；如需完整还原，请使用启用前备份。
 
 模式保守拒绝非空自定义片段、未受管 enabled 站点、额外 conf.d、主配置内联 server 或额外 include，而不尝试重写任意 nginx 语法。策略先按 nginx 词法处理引号、转义和注释，再递归审查完整可达 include 图，拒绝环和过深依赖；受管文件名不是信任凭证，其内容同样检查。mime.types 只接受 types 数据块、模块入口只接受 load_module，所有请求上下文的日志必须使用固定安全格式或关闭，日志文件名不得包含变量。HTTP 层必须实际包含安全日志定义与继承配置，缺失、被清空、格式被篡改均拒绝。转换前只预检将被重建的受管文件，生成后提交前再做完整校验；nginx -t 或 reload 失败会恢复策略、生成文件、权限和符号链接。需要这些配置时应先纳入生成器并补覆盖测试，不能绕过校验后宣称隐私保证。该功能不清理既有日志、不保护后端应用或外部代理的日志，也不阻止客户端/上游接收原始 query；历史已泄露凭据需另外轮换。
 

@@ -357,7 +357,7 @@ def queryless_logs():
     return policy == 'queryless'
 
 
-def nginx_statements(text):
+def nginx_statements(text, with_spans=False):
     """Tokenize nginx syntax before interpreting directive names or include edges.
 
     Quotes concatenate with bare tokens; comments are recognized only outside
@@ -367,6 +367,8 @@ def nginx_statements(text):
     tokens, word, started, quote, i = [], [], False, None, 0
     while i < len(text):
         c = text[i]
+        if not started and not c.isspace() and c not in '{};#':
+            word_start = i
         if c == '\\':
             i += 1
             if i == len(text):
@@ -389,10 +391,10 @@ def nginx_statements(text):
             continue
         elif c.isspace() or c in '{};':
             if started:
-                tokens.append(('word', ''.join(word)))
+                tokens.append(('word', ''.join(word), word_start, i))
                 word, started = [], False
             if c in '{};':
-                tokens.append((c, c))
+                tokens.append((c, c, i, i + 1))
         else:
             word.append(c)
             started = True
@@ -400,15 +402,17 @@ def nginx_statements(text):
     if quote:
         raise Fail('queryless: unclosed nginx quote')
     if started:
-        tokens.append(('word', ''.join(word)))
+        tokens.append(('word', ''.join(word), word_start, i))
     pos = 0
     def block(nested=False):
         nonlocal pos
         nodes, args = [], []
         while pos < len(tokens):
-            kind, value = tokens[pos]
+            kind, value, start, end = tokens[pos]
             pos += 1
             if kind == 'word':
+                if not args:
+                    statement_start = start
                 args.append(value)
             elif kind == '}':
                 if args or not nested:
@@ -417,15 +421,57 @@ def nginx_statements(text):
             elif not args:
                 raise Fail('queryless: empty nginx directive')
             elif kind == ';':
-                nodes.append((args, None))
+                nodes.append((args, None, statement_start, end) if with_spans else (args, None))
                 args = []
             elif kind == '{':
-                nodes.append((args, block(True)))
+                children = block(True)
+                nodes.append((args, children, statement_start, tokens[pos - 1][3]) if with_spans else (args, children))
                 args = []
         if nested or args:
             raise Fail('queryless: incomplete nginx statement')
         return nodes
     return block()
+
+
+def main_log_replacement(args, children):
+    """Only static, ordinary main-file log directives are convertible."""
+    if children is not None or len(args) not in (2, 3):
+        raise Fail('queryless: unsupported main log directive')
+    name, target = args[:2]
+    if name == 'access_log' and args[1:] == ['off']:
+        return 'access_log off;'
+    if not os.path.isabs(target) or '$' in target or any(ord(c) < 32 for c in target):
+        raise Fail('queryless: main log target must be a static absolute path')
+    if name == 'error_log':
+        if len(args) == 3 and args[2] not in ('debug', 'info', 'notice', 'warn', 'error', 'crit', 'alert', 'emerg'):
+            raise Fail('queryless: unsupported main error severity')
+        return 'error_log /dev/null;'
+    if name != 'access_log' or (len(args) == 3 and not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', args[2])):
+        raise Fail('queryless: unsupported main access format')
+    # A format declared in a later include cannot be referenced here. The
+    # generated HTTP include installs safe access inheritance after its format.
+    return 'access_log off;'
+
+
+def queryless_main_config(text):
+    """Rewrite only explicit root/http log statement spans, preserving all else."""
+    replacements, root_errors = [], []
+    def walk(nodes, ctx=()):
+        for args, children, start, end in nodes:
+            if args[0] in ('access_log', 'error_log') and ctx in ((), ('http',)):
+                if args[0] == 'access_log' and not ctx:
+                    raise Fail('queryless: access_log outside http')
+                replacements.append((start, end, main_log_replacement(args, children)))
+                if not ctx and args[0] == 'error_log':
+                    root_errors.append(True)
+            if children is not None:
+                walk(children, ctx + (args[0],))
+    walk(nginx_statements(text, with_spans=True))
+    for start, end, replacement in reversed(replacements):
+        text = text[:start] + replacement + text[end:]
+    if not root_errors:
+        text = 'error_log /dev/null;\n' + text
+    return text
 
 
 def privacy_guard(preparing=False):
@@ -494,9 +540,14 @@ def privacy_guard(preparing=False):
                         visit(child, ctx)
                 if real == main and name == 'server':
                     raise Fail('queryless 不接受主配置内联 server')
-                skip_logs = preparing and real in managed
+                convertible_main_log = real == main and ctx in ((), ('http',)) and name in ('access_log', 'error_log')
+                if preparing and convertible_main_log:
+                    if name == 'access_log' and not ctx:
+                        raise Fail('queryless: access_log outside http')
+                    main_log_replacement(args, children)
+                skip_logs = preparing and (real in managed or convertible_main_log)
                 if not skip_logs:
-                    if name == 'error_log' and ctx and (len(args) != 2 or args[1] != '/dev/null'):
+                    if name == 'error_log' and (len(args) != 2 or args[1] != '/dev/null'):
                         raise Fail('queryless: raw request error_log is forbidden')
                     if name == 'access_log' and (len(args) < 2 or (args[1:] != ['off'] and (len(args) != 3 or args[2] != 'ngx_queryless' or '$' in args[1] or not os.path.isabs(args[1])))):
                         raise Fail('queryless: raw access_log is forbidden')
@@ -531,6 +582,14 @@ def cmd_privacy(a):
     with Tx() as tx:
         config_set('LOG_PRIVACY', a.policy)
         privacy_guard(preparing=True)
+        if queryless_logs():
+            main = f'{ETC}/nginx.conf'
+            if os.path.islink(main):
+                raise Fail('queryless: main configuration symlink is not convertible')
+            original = read(main)
+            converted = queryless_main_config(original)
+            if converted != original:
+                write(main, converted, os.stat(main).st_mode & 0o7777)
         layout()
         for site in all_sites():
             if site['type'] != 'external':
@@ -740,7 +799,7 @@ def managed_paths():
     paths = set()
     for d in ('sites-available', 'sites-enabled', 'snippets', 'conf.d'):
         paths.update(glob.glob(f'{ETC}/{d}/ngx-*'))
-    for p in (f'{ETC}/ngx-default.disabled', f'{ETC}/sites-enabled/default',
+    for p in (f'{ETC}/nginx.conf', f'{ETC}/ngx-default.disabled', f'{ETC}/sites-enabled/default',
               f'{SYSTEMD}/ngx-cf-update.service', f'{SYSTEMD}/ngx-cf-update.timer'):
         if os.path.lexists(p):
             paths.add(p)

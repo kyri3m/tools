@@ -38,7 +38,10 @@ class PrivacyTests(unittest.TestCase):
                 (root / 'run').mkdir()
                 (etc / 'nginx.conf').write_text(
                     f'pid {root}/run/nginx.pid;\nerror_log {root}/master-error.log info;\n'
-                    f'events {{}}\nhttp {{\ninclude {etc}/conf.d/*.conf;\ninclude {etc}/sites-enabled/*;\n}}\n')
+                    f'events {{}}\nhttp {{\naccess_log {root}/distro-access.log;\ninclude {etc}/conf.d/*.conf;\ninclude {etc}/sites-enabled/*;\n}}\n')
+                if policy == 'queryless':
+                    main = etc / 'nginx.conf'
+                    main.write_text(m['queryless_main_config'](main.read_text()))
                 m['config_set']('LOG_PRIVACY', policy)
                 m['layout']()
                 http_port, tls_port, dead_port = port(), port(), port()
@@ -263,7 +266,8 @@ class PrivacyTests(unittest.TestCase):
                 root = Path(tmp)
                 etc = root / 'etc/nginx'
                 etc.mkdir(parents=True)
-                (etc / 'nginx.conf').write_text(f'pid {root}/nginx.pid; error_log /dev/null; events {{}} http {{ include {etc}/conf.d/*.conf; include {etc}/sites-enabled/*; }}')
+                (etc / 'nginx.conf').write_text(f'pid {root}/nginx.pid; error_log {root}/original-error.log warn; events {{}} http {{ access_log {root}/original-access.log combined; include {etc}/conf.d/*.conf; include {etc}/sites-enabled/*; }}')
+                (etc / 'nginx.conf').chmod(0o640)
                 m['config_set']('LOG_PRIVACY', 'standard')
                 m['layout']()
                 def snapshot():
@@ -289,6 +293,21 @@ class PrivacyTests(unittest.TestCase):
                 self.assertEqual(m['config_get']('LOG_PRIVACY'), 'standard')
                 self.assertEqual(snapshot(), before, 'generated files, policy, modes and symlinks must roll back')
 
+    def test_main_log_spans_preserve_other_configuration(self):
+        m = runpy.run_path(str(SOURCE))
+        original = ('# keep this exactly\nuser nginx;\n"error_"log /var/log/nginx/error.log warn; # tail\n'
+                    'events { worker_connections 123; }\nhttp {\n  access_log /var/log/nginx/access.log;\n'
+                    '  error_log /var/log/nginx/http-error.log error;\n  sendfile on; # untouched\n}\n')
+        expected = original.replace('"error_"log /var/log/nginx/error.log warn;', 'error_log /dev/null;').replace(
+            'access_log /var/log/nginx/access.log;', 'access_log off;').replace(
+            'error_log /var/log/nginx/http-error.log error;', 'error_log /dev/null;')
+        self.assertEqual(m['queryless_main_config'](original), expected)
+        self.assertEqual(m['queryless_main_config'](expected), expected)
+        for directive in ('access_log /tmp/log combined buffer=32k;', 'access_log /tmp/$host.log;',
+                          'error_log syslog:server=127.0.0.1;', 'error_log /tmp/log $level;'):
+            with self.subTest(directive=directive), self.assertRaises(m['Fail']):
+                m['queryless_main_config']('events {} http {' + directive + '}')
+
     def test_cli_transaction_and_rollback(self):
         with tempfile.TemporaryDirectory(prefix='ngx-privacy-cli-') as tmp:
             root = Path(tmp)
@@ -303,8 +322,17 @@ class PrivacyTests(unittest.TestCase):
             enabled = cli('queryless', '-y')
             self.assertEqual(enabled.returncode, 0, enabled.stderr)
             self.assertIn('queryless', cli().stdout)
+            self.assertIn('error_log /dev/null;', main.read_text())
             disabled = cli('standard', '-y')
             self.assertEqual(disabled.returncode, 0, disabled.stderr)
+            standard_main = main.read_text()
+            unsupported_main = standard_main.replace('http {', 'http { access_log /tmp/$host.log;')
+            main.write_text(unsupported_main)
+            refused = cli('queryless', '-y')
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual(main.read_text(), unsupported_main, 'unsupported main syntax must not be rewritten')
+            self.assertEqual(cli().stdout.strip(), 'standard')
+            main.write_text(standard_main)
             custom = root / 'etc/ngx/custom/fail.conf'
             custom.write_text('error_log /tmp/raw.log;')
             refused = cli('queryless', '-y')
