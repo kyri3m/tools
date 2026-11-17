@@ -31,6 +31,18 @@ ngx cf token set                       # 可选：Cloudflare API Token
 Cloudflare Token 创建：My Profile → API Tokens → Create Token → 模板「Edit zone DNS」。
 权限：`Zone · DNS · Edit` + `Zone · Zone · Read`，资源只选需要的域名。
 
+## 日志隐私（可选，全站）
+
+`ngx privacy` 查询当前策略；默认 `standard` 保持原有请求日志。`ngx privacy queryless` 在同一事务内重建所有受管站点（包括 HTTP 跳转、80/443 默认站点、ACME 和 HTTPS），校验成功后才重载；`ngx privacy standard` 恢复标准策略。设置前会要求确认，自动化可显式使用 `-y`。
+
+queryless access 仅保留时间、状态码、字节数和请求/上游计时，不包含 URL、路径、query、用户名、Host、Referer、User-Agent 或其他请求头。不能仅删 `$args`：`$request`、`$request_uri` 和 Referer 等同样可能携带凭据。
+
+**代价：queryless 将 HTTP 上下文及所有受管 server 的原生 `error_log` 指向 `/dev/null`，丢弃原生请求错误详情，而不是将错误日志“脱敏”。** nginx 1.26 原生 error_log 无类似 log_format 的字段控制，升至 crit/emerg 仍不能保证消息不附带原始 request；仅代理 location 设置还会遗漏默认 server、ACME、跳转和解析早期错误。安全 access 的 4xx/5xx 与计时仍可用于监控。`ngx top` 依赖 IP/路径字段，在 queryless 下明确拒绝，不会把无法解析的安全日志误报成零请求；改用 `ngx logs` 或状态码监控。进程启动/配置错误仍由 nginx 自身运维通道报告；不要对含真实秘密的配置运行日志转储。
+
+模式保守拒绝非空自定义片段、未受管 enabled 站点、额外 conf.d、主配置内联 server 或额外 include，而不尝试重写任意 nginx 语法。策略先按 nginx 词法处理引号、转义和注释，再递归审查完整可达 include 图，拒绝环和过深依赖；受管文件名不是信任凭证，其内容同样检查。mime.types 只接受 types 数据块、模块入口只接受 load_module，所有请求上下文的日志必须使用固定安全格式或关闭，日志文件名不得包含变量。HTTP 层必须实际包含安全日志定义与继承配置，缺失、被清空、格式被篡改均拒绝。转换前只预检将被重建的受管文件，生成后提交前再做完整校验；nginx -t 或 reload 失败会恢复策略、生成文件、权限和符号链接。需要这些配置时应先纳入生成器并补覆盖测试，不能绕过校验后宣称隐私保证。该功能不清理既有日志、不保护后端应用或外部代理的日志，也不阻止客户端/上游接收原始 query；历史已泄露凭据需另外轮换。
+
+参考：[官方 access_log/log_format](https://nginx.org/en/docs/http/ngx_http_log_module.html)、[官方 error_log](https://nginx.org/en/docs/ngx_core_module.html#error_log)。隔离回归：`python3 test/test_privacy.py -v`，只创建临时根、loopback 高端口、合成 PEM 和 dummy query；不加载生产配置。
+
 ## 常用
 
 ```bash

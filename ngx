@@ -350,6 +350,194 @@ def needs_cert(site):
     return days is None or days < 1 or not set(site['domains']) <= names
 
 # ---------- nginx 配置生成 ----------
+def queryless_logs():
+    policy = config_get('LOG_PRIVACY', 'standard')
+    if policy not in ('standard', 'queryless'):
+        raise Fail('LOG_PRIVACY 只能是 standard 或 queryless')
+    return policy == 'queryless'
+
+
+def nginx_statements(text):
+    """Tokenize nginx syntax before interpreting directive names or include edges.
+
+    Quotes concatenate with bare tokens; comments are recognized only outside
+    quotes. Escapes are decoded, so quoted/escaped directive names cannot hide
+    from the policy. Ambiguous or incomplete syntax fails closed.
+    """
+    tokens, word, started, quote, i = [], [], False, None, 0
+    while i < len(text):
+        c = text[i]
+        if c == '\\':
+            i += 1
+            if i == len(text):
+                raise Fail('queryless: incomplete nginx escape')
+            # nginx preserves unknown escapes; decoding them would audit a
+            # different include filename from the one nginx actually opens.
+            escaped = {'n': '\n', 'r': '\r', 't': '\t', '\\': '\\', '"': '"', "'": "'"}
+            word.append(escaped.get(text[i], '\\' + text[i]))
+            started = True
+        elif quote:
+            if c == quote:
+                quote = None
+            else:
+                word.append(c)
+        elif c in ('"', "'"):
+            quote, started = c, True
+        elif c == '#':
+            while i < len(text) and text[i] != '\n':
+                i += 1
+            continue
+        elif c.isspace() or c in '{};':
+            if started:
+                tokens.append(('word', ''.join(word)))
+                word, started = [], False
+            if c in '{};':
+                tokens.append((c, c))
+        else:
+            word.append(c)
+            started = True
+        i += 1
+    if quote:
+        raise Fail('queryless: unclosed nginx quote')
+    if started:
+        tokens.append(('word', ''.join(word)))
+    pos = 0
+    def block(nested=False):
+        nonlocal pos
+        nodes, args = [], []
+        while pos < len(tokens):
+            kind, value = tokens[pos]
+            pos += 1
+            if kind == 'word':
+                args.append(value)
+            elif kind == '}':
+                if args or not nested:
+                    raise Fail('queryless: invalid nginx block boundary')
+                return nodes
+            elif not args:
+                raise Fail('queryless: empty nginx directive')
+            elif kind == ';':
+                nodes.append((args, None))
+                args = []
+            elif kind == '{':
+                nodes.append((args, block(True)))
+                args = []
+        if nested or args:
+            raise Fail('queryless: incomplete nginx statement')
+        return nodes
+    return block()
+
+
+def privacy_guard(preparing=False):
+    """保守拒绝不受生成器控制的上下文；不尝试解析或重写用户 nginx 语法。"""
+    if not queryless_logs():
+        return
+    main = os.path.realpath(f'{ETC}/nginx.conf')
+    managed = {os.path.realpath(conf_path(s['name'])) for s in all_sites() if s['type'] != 'external'}
+    managed.add(os.path.realpath(f'{ETC}/sites-available/ngx-acme-80.conf'))
+    managed.update(os.path.realpath(f'{ETC}/{p}') for p in (
+        'conf.d/ngx-http.conf', 'conf.d/ngx-cloudflare-realip.conf',
+        'snippets/ngx-ssl.conf', 'snippets/ngx-security.conf',
+        'snippets/ngx-proxy.conf', 'snippets/ngx-acme.conf'))
+    for path in glob.glob(CUSTOM + '/*.conf'):
+        if nginx_statements(read(path)):
+            raise Fail('queryless 不接受非空自定义片段')
+    for path in glob.glob(f'{ETC}/sites-enabled/*'):
+        if os.path.realpath(path) not in managed:
+            raise Fail('queryless 不接受未受管的 enabled 站点')
+    for path in glob.glob(f'{ETC}/conf.d/*.conf'):
+        if os.path.realpath(path) not in managed:
+            raise Fail('queryless 不接受额外 conf.d 配置')
+    allowed_main = {f'{ETC}/mime.types', f'{ETC}/conf.d/*.conf',
+                    f'{ETC}/sites-enabled/*', f'{ETC}/modules-enabled/*.conf'}
+    safe_format = ('$time_iso8601 $status $body_bytes_sent $request_time '
+                   '$upstream_response_time $upstream_status')
+    active, seen_http, safe_http = set(), [], []
+    def visit(path, context):
+        real = os.path.realpath(path)
+        if real in active or len(active) >= 32:
+            raise Fail('queryless: cyclic or excessive nginx include graph')
+        active.add(real)
+        nodes = nginx_statements(read(path))
+        if real == os.path.realpath(f'{ETC}/conf.d/ngx-http.conf') and context == ('http',):
+            declarations = [args for args, children in nodes if children is None]
+            safe_http.append(['error_log', '/dev/null'] in declarations and
+                             ['access_log', f'{LOG}/ngx-http.access.log', 'ngx_queryless'] in declarations and
+                             any(a[:2] == ['log_format', 'ngx_queryless'] and ''.join(a[2:]) == safe_format for a in declarations))
+        def walk(nodes, ctx):
+            for args, children in nodes:
+                name = args[0]
+                # These leaf contexts are data, not arbitrary request configuration.
+                if real == os.path.realpath(f'{ETC}/mime.types'):
+                    if ctx == ('http',):
+                        if args != ['types'] or children is None:
+                            raise Fail('queryless: mime.types must contain only types blocks')
+                    elif ctx != ('http', 'types') or children is not None:
+                        raise Fail('queryless: invalid mime.types content')
+                if '/modules-enabled/' in path and (ctx or name != 'load_module' or children is not None):
+                    raise Fail('queryless: module include must contain only load_module')
+                if name == 'include':
+                    if children is not None or len(args) != 2 or '$' in args[1]:
+                        raise Fail('queryless: unsupported include syntax')
+                    target = args[1]
+                    if not os.path.isabs(target):
+                        target = os.path.join(ETC, target)
+                    if real == main and target not in allowed_main:
+                        raise Fail('queryless 不接受主配置额外 include')
+                    matches = sorted(glob.glob(target))
+                    if not matches and not glob.has_magic(target):
+                        raise Fail('queryless: missing include')
+                    for child in matches:
+                        child_real = os.path.realpath(child)
+                        if child_real not in managed and child_real != os.path.realpath(f'{ETC}/mime.types') and not child.startswith(f'{ETC}/modules-enabled/') and not child.startswith(CUSTOM + '/'):
+                            raise Fail('queryless: uncontrolled include target')
+                        visit(child, ctx)
+                if real == main and name == 'server':
+                    raise Fail('queryless 不接受主配置内联 server')
+                skip_logs = preparing and real in managed
+                if not skip_logs:
+                    if name == 'error_log' and ctx and (len(args) != 2 or args[1] != '/dev/null'):
+                        raise Fail('queryless: raw request error_log is forbidden')
+                    if name == 'access_log' and (len(args) < 2 or (args[1:] != ['off'] and (len(args) != 3 or args[2] != 'ngx_queryless' or '$' in args[1] or not os.path.isabs(args[1])))):
+                        raise Fail('queryless: raw access_log is forbidden')
+                    if name == 'log_format' and len(args) > 1 and args[1] == 'ngx_queryless' and (children is not None or ''.join(args[2:]) != safe_format):
+                        raise Fail('queryless: unsafe queryless log format')
+                if children is not None:
+                    if name == 'http':
+                        seen_http.append(True)
+                    walk(children, ctx + (name,))
+        walk(nodes, context)
+        active.remove(real)
+    visit(main, ())
+    if not seen_http or (not preparing and (not safe_http or not all(safe_http))):
+        raise Fail('queryless: missing safe HTTP log inheritance')
+
+
+def site_logs(name):
+    if queryless_logs():
+        # 原生 error_log 无脱敏格式；提高 severity 也不能保证不含原始 request。
+        return [f'    access_log {LOG}/ngx-{name}.access.log ngx_queryless;',
+                '    error_log /dev/null;']
+    return [f'    access_log {LOG}/ngx-{name}.access.log ngx buffer=32k flush=5s;',
+            f'    error_log {LOG}/ngx-{name}.error.log;']
+
+
+def cmd_privacy(a):
+    if not a.policy:
+        print(config_get('LOG_PRIVACY', 'standard'))
+        return
+    if not confirm('修改全站日志策略；queryless 会丢弃 nginx 原生请求错误详情，确认？'):
+        raise Fail('已取消')
+    with Tx() as tx:
+        config_set('LOG_PRIVACY', a.policy)
+        privacy_guard(preparing=True)
+        layout()
+        for site in all_sites():
+            if site['type'] != 'external':
+                generate(site)
+        tx.commit()
+
+
 def layout():
     for d in ('sites-available', 'sites-enabled', 'snippets', 'conf.d'):
         os.makedirs(f'{ETC}/{d}', exist_ok=True)
@@ -399,7 +587,13 @@ location ^~ /.well-known/acme-challenge/ {{
     }
     for name, content in snippets.items():
         write(f'{ETC}/snippets/{name}', content)
+    privacy = ('error_log /dev/null;\n' if queryless_logs() else '')
+    safe_access = (f'access_log {LOG}/ngx-http.access.log ngx_queryless;' if queryless_logs() else '')
     write(f'{ETC}/conf.d/ngx-http.conf', f'''{MARK}
+{privacy}# queryless 只记录受控状态与计时；不记录 URL、请求头或远端提供的自由文本。
+log_format ngx_queryless '$time_iso8601 $status $body_bytes_sent $request_time '
+                         '$upstream_response_time $upstream_status';
+{safe_access}
 # 非 WebSocket 请求发空 Connection 头，配合 upstream keepalive 复用到后端的连接。
 map $http_upgrade $connection_upgrade {{
     default upgrade;
@@ -422,7 +616,7 @@ server {{
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
-    access_log {LOG}/ngx-acme-80.access.log ngx;
+{chr(10).join(site_logs('acme-80'))}
     include {ETC}/snippets/ngx-acme.conf;
     location / {{ return 404; }}
 }}
@@ -431,6 +625,7 @@ server {{
     listen 443 ssl default_server;
     listen [::]:443 ssl default_server;
     server_name _;
+{chr(10).join(site_logs('reject-443'))}
     ssl_reject_handshake on;
 }}
 ''')
@@ -477,8 +672,8 @@ def render(site):
 
     out = [MARK, f'# 由 ngx 生成，请勿手改：用 ngx set/route 修改；自定义片段写在 {CUSTOM}/{name}.conf', 'server {']
     ssl_flag = ' ssl' if tls else ''
-    out += [f'    listen {port}{ssl_flag};', f'    listen [::]:{port}{ssl_flag};', f'    server_name {names};',
-            f'    access_log {LOG}/ngx-{name}.access.log ngx buffer=32k flush=5s;', f'    error_log {LOG}/ngx-{name}.error.log;']
+    out += [f'    listen {port}{ssl_flag};', f'    listen [::]:{port}{ssl_flag};', f'    server_name {names};']
+    out += site_logs(name)
     if site['headers']:
         out.append(f'    include {ETC}/snippets/ngx-security.conf;')
     out.append(f'    include {ETC}/snippets/ngx-acme.conf;')
@@ -512,8 +707,9 @@ def render(site):
     out.append('}')
     if port != 80:
         target = f'{scheme}://$host' + ('' if (tls and port == 443) or (not tls and port == 80) else f':{port}') + '$request_uri'
-        out += ['server {', '    listen 80;', '    listen [::]:80;', f'    server_name {names};',
-                f'    include {ETC}/snippets/ngx-acme.conf;', f'    location / {{ return 301 {target}; }}', '}']
+        out += ['server {', '    listen 80;', '    listen [::]:80;', f'    server_name {names};']
+        out += site_logs(name + '-redirect')
+        out += [f'    include {ETC}/snippets/ngx-acme.conf;', f'    location / {{ return 301 {target}; }}', '}']
     head = []
     for server, pool in pools.items():
         head += [f'upstream {pool} {{', f'    server {server};', '    keepalive 32;', '}']
@@ -627,6 +823,7 @@ class Tx:
         return False
 
 def nginx_test():
+    privacy_guard()
     cmd = ['nginx', '-t'] + (['-p', ROOT + '/', '-c', ETC + '/nginx.conf'] if ROOT else [])
     p = run(cmd, check=False)
     if p.returncode:
@@ -1814,6 +2011,8 @@ def cmd_logs(a):
         pass
 
 def cmd_top(a):
+    if queryless_logs():
+        raise Fail('queryless 不记录来源 IP/路径，ngx top 不适用；请用 ngx logs 查看安全状态与计时')
     files = log_files(load(a.name), 'access') if a.name else glob.glob(f'{LOG}/ngx-*.access.log')
     m = re.fullmatch(r'([1-9][0-9]*)([mhd])', a.since)
     if not m:
@@ -2330,6 +2529,7 @@ HELP = f'''ngx {VERSION} —— 把本机服务反代成 HTTPS 网站
   ngx install [--email 邮箱]            安装依赖并初始化（新服务器先运行）
   ngx backup [--with-keys] / ngx restore <文件>
   ngx adopt [--dry-run] / ngx forget <网站>   登记/取消登记手写的 nginx 站点
+  ngx privacy [standard|queryless]      全站日志策略；queryless 丢弃原生请求错误详情
   ngx test | reload | restart
 
   全局选项：-y/--yes 跳过确认   --open-firewall 自动放行防火墙端口
@@ -2380,6 +2580,7 @@ def build_parser():
     c = cmd('backup'); c.add_argument('--with-keys', action='store_true')
     c = cmd('restore'); c.add_argument('file')
     c = cmd('adopt'); c.add_argument('--dry-run', action='store_true')
+    c = cmd('privacy'); c.add_argument('policy', nargs='?', choices=['standard', 'queryless'])
     for n in ('test', 'reload', 'restart', 'help', '_dns-auth', '_dns-cleanup'):
         cmd(n)
     return p
@@ -2429,7 +2630,7 @@ def main(argv):
         'rm': lambda: cmd_rm(a), 'remove': lambda: cmd_rm(a), 'cert': lambda: cmd_cert(a), 'cf': lambda: cmd_cf(a),
         'dns': lambda: cmd_dns(dict_action(a)), 'logs': lambda: cmd_logs(a), 'top': lambda: cmd_top(a),
         'doctor': lambda: cmd_doctor(a), 'install': lambda: cmd_install(a), 'backup': lambda: cmd_backup(a),
-        'restore': lambda: cmd_restore(a), 'adopt': lambda: cmd_adopt(a),
+        'restore': lambda: cmd_restore(a), 'adopt': lambda: cmd_adopt(a), 'privacy': lambda: cmd_privacy(a),
         'test': lambda: (nginx_test(), ok('nginx 配置正确')),
         'reload': lambda: (nginx_test(), nginx_reload(), ok('已重新加载')),
         'restart': lambda: (nginx_test(), sys_cmd(['systemctl', 'restart', 'nginx']), ok('已重启')),
